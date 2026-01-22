@@ -5,7 +5,7 @@ use model_qwen3::{Config, Qwen3Model};
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor, IndexOp};
 use candle_nn::VarBuilder;
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use tokenizers::Tokenizer;
 use std::io::Write;
 
@@ -17,10 +17,10 @@ fn main() -> Result<()> {
     // ==========================================
     // 指定 Qwen3 官方模型 ID
     // ==========================================
-    let model_repo_id = "Qwen/Qwen3-1.7B";
+    let model_repo_id = "Qwen/Qwen3-4B";
     
     println!("📥 正在连接 HuggingFace: {} ...", model_repo_id);
-    let api = Api::new()?;
+    let api = ApiBuilder::from_env().build()?;
     let repo = api.repo(Repo::new(model_repo_id.to_string(), RepoType::Model));
 
     // 2. 下载基础文件
@@ -33,8 +33,9 @@ fn main() -> Result<()> {
     // ==========================================
     println!("📥 检测到模型为分片格式，开始下载权重...");
     let filenames = vec![
-        repo.get("model-00001-of-00002.safetensors")?,
-        repo.get("model-00002-of-00002.safetensors")?,
+        repo.get("model-00001-of-00003.safetensors")?,
+        repo.get("model-00002-of-00003.safetensors")?,
+        repo.get("model-00003-of-00003.safetensors")?,
     ];
     println!("✅ 权重下载完成");
 
@@ -108,7 +109,7 @@ fn main() -> Result<()> {
     std::io::stdout().flush()?;
 
     // --- 阶段二：解码循环 (Decode Loop) ---
-    let max_new_tokens = 1024; 
+    let max_new_tokens = 5096; 
     let mut current_pos = input_ids.len();
 
     for _ in 0..max_new_tokens {

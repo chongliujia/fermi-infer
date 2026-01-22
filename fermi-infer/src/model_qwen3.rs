@@ -7,6 +7,7 @@ use serde::Deserialize;
 pub struct Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
+    pub head_dim: usize,
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -19,7 +20,7 @@ pub struct Config {
 
 impl Config {
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim
     }
 }
 
@@ -279,16 +280,26 @@ pub struct Qwen3Model {
 
 impl Qwen3Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        let embed_tokens =
+            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_layers = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
             layers.push(Block::new(cfg, vb_layers.pp(i))?);
         }
         let norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
-        let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        let lm_head = if vb.contains_tensor("lm_head.weight") {
+            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        } else {
+            Linear::new(embed_tokens.embeddings().clone(), None)
+        };
 
-        Ok(Self { embed_tokens, layers, norm, lm_head })
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
