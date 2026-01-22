@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
+
+# Env files
+.env
+.env.*
+
+# Benchmark outputs
+criterion/
