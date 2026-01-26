@@ -1,8 +1,7 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{VarBuilder, linear_no_bias, Linear}; // ✅ 移除了未使用的 Activation
+use candle_nn::{linear_no_bias, Linear, VarBuilder};
 use serde::Deserialize;
 
-// ================= Config 定义 =================
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub vocab_size: usize,
@@ -13,6 +12,7 @@ pub struct Config {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
+    #[allow(dead_code)]
     pub sliding_window: Option<usize>,
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
@@ -24,7 +24,6 @@ impl Config {
     }
 }
 
-// ================= Rotary Embedding (RoPE) =================
 #[derive(Debug, Clone)]
 struct RotaryEmbedding {
     sin: Tensor,
@@ -41,7 +40,9 @@ impl RotaryEmbedding {
             .collect();
         let inv_freq_len = inv_freq.len();
         let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?.to_dtype(dtype)?.reshape((max_seq_len, 1))?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+            .to_dtype(dtype)?
+            .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         Ok(Self {
             sin: freqs.sin()?,
@@ -59,7 +60,6 @@ impl RotaryEmbedding {
     }
 }
 
-// ================= Attention 层 (无 Bias) =================
 struct Attention {
     q_proj: Linear,
     k_proj: Linear,
@@ -71,24 +71,29 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rotary_emb: RotaryEmbedding,
-    cache_k: Option<Tensor>,
-    cache_v: Option<Tensor>,
+    cache_k: Vec<Tensor>,
+    cache_v: Vec<Tensor>,
+    cache_k_tail: Option<Tensor>,
+    cache_v_tail: Option<Tensor>,
+    cache_len: usize,
 }
 
 impl Attention {
+    const KV_CHUNK_SIZE: usize = 128;
+
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim();
-        
+
         let q_proj = linear_no_bias(hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
         let k_proj = linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
         let v_proj = linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
         let q_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
-        
+
         let rotary_emb = RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?;
 
         Ok(Self {
@@ -102,8 +107,11 @@ impl Attention {
             num_kv_heads,
             head_dim,
             rotary_emb,
-            cache_k: None,
-            cache_v: None,
+            cache_k: Vec::new(),
+            cache_v: Vec::new(),
+            cache_k_tail: None,
+            cache_v_tail: None,
+            cache_len: 0,
         })
     }
 
@@ -111,16 +119,17 @@ impl Attention {
         let (b, seq_len, _hidden) = x.dims3()?;
 
         if seqlen_offset == 0 {
-            self.cache_k = None;
-            self.cache_v = None;
+            self.clear_cache();
         }
-        
+
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
         let q = q.reshape((b, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((b, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+        let k = k
+            .reshape((b, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
         let v = v
             .reshape((b, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?
@@ -131,29 +140,34 @@ impl Attention {
 
         let (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offset)?;
 
-        let cache_len = match &self.cache_k {
-            Some(k_cache) => k_cache.dims4()?.2,
-            None => 0,
-        };
+        let prev_cache_len = self.cache_len;
+        self.append_kv(&k, &v)?;
 
-        let (k_cat, v_cat) = match (&self.cache_k, &self.cache_v) {
-            (Some(k_cache), Some(v_cache)) if seqlen_offset > 0 => {
-                let k = Tensor::cat(&[k_cache, &k], 2)?;
-                let v = Tensor::cat(&[v_cache, &v], 2)?;
-                (k, v)
+        let y = if seq_len == 1 {
+            let mut segments: Vec<(&Tensor, &Tensor)> = Vec::new();
+            for (k_seg, v_seg) in self.cache_k.iter().zip(self.cache_v.iter()) {
+                segments.push((k_seg, v_seg));
             }
-            _ => (k, v),
-        };
+            if let (Some(k_tail), Some(v_tail)) = (&self.cache_k_tail, &self.cache_v_tail) {
+                segments.push((k_tail, v_tail));
+            }
 
-        let y = if x.device().is_metal() && seq_len == 1 {
-            candle_nn::ops::sdpa(&q, &k_cat, &v_cat, 1. / (self.head_dim as f32).sqrt(), 1.)?
+            if x.device().is_metal() && segments.len() == 1 {
+                let (k_seg, v_seg) = segments[0];
+                let k_rep = self.repeat_kv(k_seg)?;
+                let v_rep = self.repeat_kv(v_seg)?;
+                candle_nn::ops::sdpa(&q, &k_rep, &v_rep, 1. / (self.head_dim as f32).sqrt(), 1.)?
+            } else {
+                self.segmented_attention(&q, &segments)?
+            }
         } else {
+            let (k_cat, v_cat) = self.concat_cache()?;
             let k_rep = self.repeat_kv(&k_cat)?;
             let v_rep = self.repeat_kv(&v_cat)?;
 
             let att = (q.matmul(&k_rep.t()?)? / (self.head_dim as f64).sqrt())?;
             let att = if seq_len > 1 {
-                let mask = self.causal_mask(seq_len, cache_len, att.dtype(), x.device())?;
+                let mask = self.causal_mask(seq_len, prev_cache_len, att.dtype(), x.device())?;
                 att.broadcast_add(&mask)?
             } else {
                 att
@@ -161,9 +175,6 @@ impl Attention {
             let att = candle_nn::ops::softmax(&att, 3)?;
             att.matmul(&v_rep.contiguous()?)?
         };
-
-        self.cache_k = Some(k_cat);
-        self.cache_v = Some(v_cat);
 
         let y = y.transpose(1, 2)?.reshape((b, seq_len, ()))?;
         self.o_proj.forward(&y)
@@ -200,12 +211,134 @@ impl Attention {
     }
 
     fn clear_cache(&mut self) {
-        self.cache_k = None;
-        self.cache_v = None;
+        self.cache_k.clear();
+        self.cache_v.clear();
+        self.cache_k_tail = None;
+        self.cache_v_tail = None;
+        self.cache_len = 0;
+    }
+
+    fn append_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        let seq_len = k.dims4()?.2;
+        let mut start = 0usize;
+
+        while start < seq_len {
+            let remaining = seq_len - start;
+            let cur_len = match &self.cache_k_tail {
+                Some(t) => t.dims4()?.2,
+                None => 0,
+            };
+            let space = Self::KV_CHUNK_SIZE.saturating_sub(cur_len);
+            let take = remaining.min(space);
+
+            let k_slice = k.narrow(2, start, take)?;
+            let v_slice = v.narrow(2, start, take)?;
+
+            let (new_k, new_v) = match (&self.cache_k_tail, &self.cache_v_tail) {
+                (Some(k_tail), Some(v_tail)) => {
+                    let k_next = Tensor::cat(&[k_tail, &k_slice], 2)?;
+                    let v_next = Tensor::cat(&[v_tail, &v_slice], 2)?;
+                    (k_next, v_next)
+                }
+                _ => (k_slice, v_slice),
+            };
+
+            self.cache_k_tail = Some(new_k);
+            self.cache_v_tail = Some(new_v);
+            self.cache_len += take;
+
+            if cur_len + take == Self::KV_CHUNK_SIZE {
+                if let (Some(k_full), Some(v_full)) =
+                    (self.cache_k_tail.take(), self.cache_v_tail.take())
+                {
+                    self.cache_k.push(k_full);
+                    self.cache_v.push(v_full);
+                }
+            }
+
+            start += take;
+        }
+
+        Ok(())
+    }
+
+    fn concat_cache(&self) -> Result<(Tensor, Tensor)> {
+        let mut k_list: Vec<&Tensor> = self.cache_k.iter().collect();
+        let mut v_list: Vec<&Tensor> = self.cache_v.iter().collect();
+        if let (Some(k_tail), Some(v_tail)) = (&self.cache_k_tail, &self.cache_v_tail) {
+            k_list.push(k_tail);
+            v_list.push(v_tail);
+        }
+
+        if k_list.is_empty() {
+            candle_core::bail!("kv cache is empty");
+        }
+
+        let k_cat = if k_list.len() == 1 {
+            k_list[0].clone()
+        } else {
+            Tensor::cat(&k_list, 2)?
+        };
+        let v_cat = if v_list.len() == 1 {
+            v_list[0].clone()
+        } else {
+            Tensor::cat(&v_list, 2)?
+        };
+
+        Ok((k_cat, v_cat))
+    }
+
+    fn segmented_attention(&self, q: &Tensor, segments: &[(&Tensor, &Tensor)]) -> Result<Tensor> {
+        let mut scores: Vec<Tensor> = Vec::with_capacity(segments.len());
+        let mut max_per_segment: Option<Tensor> = None;
+        for (k_seg, _) in segments {
+            let k_rep = self.repeat_kv(k_seg)?;
+            let seg_scores = (q.matmul(&k_rep.t()?)? / (self.head_dim as f64).sqrt())?;
+            let seg_max = seg_scores.max_keepdim(3)?;
+            max_per_segment = Some(match max_per_segment {
+                Some(m) => m.maximum(&seg_max)?,
+                None => seg_max,
+            });
+            scores.push(seg_scores);
+        }
+
+        let max_per_segment = match max_per_segment {
+            Some(m) => m,
+            None => candle_core::bail!("no kv segments for attention"),
+        };
+
+        let mut exp_scores: Vec<Tensor> = Vec::with_capacity(scores.len());
+        let mut denom: Option<Tensor> = None;
+        for seg_scores in scores {
+            let exp = seg_scores.broadcast_sub(&max_per_segment)?.exp()?;
+            let seg_sum = exp.sum_keepdim(3)?;
+            denom = Some(match denom {
+                Some(d) => d.broadcast_add(&seg_sum)?,
+                None => seg_sum,
+            });
+            exp_scores.push(exp);
+        }
+
+        let denom = match denom {
+            Some(d) => d,
+            None => candle_core::bail!("failed to compute attention normalization"),
+        };
+
+        let mut output: Option<Tensor> = None;
+        for (exp, (_, v_seg)) in exp_scores.into_iter().zip(segments.iter()) {
+            let v_rep = self.repeat_kv(v_seg)?;
+            let weight = exp.broadcast_div(&denom)?;
+            let seg_out = weight.matmul(&v_rep)?;
+            output = Some(match output {
+                Some(o) => o.broadcast_add(&seg_out)?,
+                None => seg_out,
+            });
+        }
+
+        output.ok_or_else(|| candle_core::Error::Msg("empty attention output".into()))
     }
 }
 
-// ================= MLP 层 (无 Bias) =================
 struct Mlp {
     gate_proj: Linear,
     up_proj: Linear,
@@ -216,26 +349,27 @@ impl Mlp {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let hidden = cfg.hidden_size;
         let intermediate = cfg.intermediate_size;
-        
+
         let gate_proj = linear_no_bias(hidden, intermediate, vb.pp("gate_proj"))?;
         let up_proj = linear_no_bias(hidden, intermediate, vb.pp("up_proj"))?;
         let down_proj = linear_no_bias(intermediate, hidden, vb.pp("down_proj"))?;
 
-        Ok(Self { gate_proj, up_proj, down_proj })
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
     }
 
-    // ✅ 修复报错: 移除 x.prev_op()，修正计算逻辑
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x_gate = self.gate_proj.forward(x)?;
         let x_gate = candle_nn::ops::silu(&x_gate)?;
-        // 关键修正：up_proj 应该接受原始输入 x，而不是 gate 的输出
-        let x_up = self.up_proj.forward(x)?; 
+        let x_up = self.up_proj.forward(x)?;
         let x = (x_gate * x_up)?;
         self.down_proj.forward(&x)
     }
 }
 
-// ================= Transformer Block =================
 struct Block {
     rms_1: candle_nn::RmsNorm,
     attn: Attention,
@@ -247,9 +381,18 @@ impl Block {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let rms_1 = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let attn = Attention::new(cfg, vb.pp("self_attn"))?;
-        let rms_2 = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?;
+        let rms_2 = candle_nn::rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
         let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
-        Ok(Self { rms_1, attn, rms_2, mlp })
+        Ok(Self {
+            rms_1,
+            attn,
+            rms_2,
+            mlp,
+        })
     }
 
     fn forward(&mut self, x: &Tensor, offset: usize) -> Result<Tensor> {
@@ -270,7 +413,6 @@ impl Block {
     }
 }
 
-// ================= 主模型定义 (Qwen3) =================
 pub struct Qwen3Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<Block>,
@@ -305,13 +447,13 @@ impl Qwen3Model {
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (_b, seq_len) = input_ids.dims2()?;
         let mut x = self.embed_tokens.forward(input_ids)?;
-        
+
         for layer in &mut self.layers {
             x = layer.forward(&x, seqlen_offset)?;
         }
-        
+
         let x = self.norm.forward(&x)?;
-        let x = x.narrow(1, seq_len - 1, 1)?; 
+        let x = x.narrow(1, seq_len - 1, 1)?;
         self.lm_head.forward(&x)
     }
 

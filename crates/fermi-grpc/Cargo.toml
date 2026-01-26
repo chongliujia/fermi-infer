@@ -1,0 +1,29 @@
+[package]
+name = "fermi-grpc"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+candle-core = "0.8.2"
+candle-nn = "0.8.2"
+fermi-io = { path = "../fermi-io" }
+fermi-runtime = { path = "../fermi-runtime" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = "0.1"
+tonic = { version = "0.11", features = ["transport"] }
+tokenizers = "0.21"
+uuid = { version = "1", features = ["v4"] }
+prost = "0.12"
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "fermi-runtime/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-core/accelerate", "fermi-runtime/metal"]

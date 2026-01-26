@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package fermi;
+
+service Fermi {
+  rpc Generate (GenerateRequest) returns (stream GenerateResponse);
+}
+
+message GenerateRequest {
+  string session_id = 1;
+  string prompt = 2;
+  uint32 max_new_tokens = 3;
+  float repeat_penalty = 4;
+  string system_prompt = 5;
+  float temperature = 6;
+  float top_p = 7;
+}
+
+message GenerateResponse {
+  string token = 1;
+  uint32 token_id = 2;
+  string session_id = 3;
+}

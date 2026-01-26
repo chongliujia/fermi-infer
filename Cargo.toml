@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/fermi-cli",
+  "crates/fermi-core",
+  "crates/fermi-io",
+  "crates/fermi-models",
+  "crates/fermi-runtime",
+  "crates/fermi-grpc",
+  "crates/fermi-openai",
+  "crates/fermi-metrics",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
