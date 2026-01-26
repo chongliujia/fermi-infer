@@ -1,0 +1,147 @@
+# fermi-infer
+
+Rust 构建的推理栈，专注 **快速启动** 与 **快速回复**（macOS / Metal 优先），同时提供 CLI、gRPC 与 OpenAI 兼容 HTTP API。
+
+## 文档
+
+- English (default): `README.md`
+- 中文文档：`README.zh-CN.md`
+
+## 亮点
+
+- **Mac 优先（Metal）**：针对 Apple Silicon 优化，默认 F16。
+- **易用服务**：本地 CLI、gRPC 流式、OpenAI 兼容 HTTP。
+- **HuggingFace 模型**：自动下载 + 本地缓存，支持离线。
+- **thinking 模式**：`thinking=on|off|auto`（OpenAI API）。
+
+## 快速开始（macOS / Metal）
+
+```bash
+cargo run -p fermi-openai --release --features metal
+```
+
+然后用 curl 测试（流式）：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role":"user","content":"你好"}],
+    "stream": true,
+    "max_tokens": 256,
+    "temperature": 0.7,
+    "thinking": "off"
+  }'
+```
+
+## OpenAI 兼容 HTTP API
+
+```bash
+cargo run -p fermi-openai --release --features metal
+```
+
+默认地址：`0.0.0.0:8000`
+
+支持端点：
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `GET /v1/models`
+
+### thinking 控制
+
+`/v1/chat/completions` 支持：
+- `thinking: "on" | "off" | "auto"`
+  - `on`：要求把思考放进 `<think>...</think>`
+  - `off`：禁止思考输出
+  - `auto`：模型支持则开启，否则关闭
+
+可通过环境变量覆盖：
+- `FERMI_SUPPORTS_THINKING=1|0`
+- `FERMI_DEFAULT_THINKING=on|off|auto`
+- `FERMI_DISABLE_THINK=1`（强制关闭）
+
+## Gradio Demo（OpenAI API）
+
+```bash
+cargo run -p fermi-openai --release --features metal
+```
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r demo/requirements.txt
+python demo/gradio_app.py
+```
+
+## CLI 运行
+
+```bash
+cargo run -p fermi-infer --release --features metal
+```
+
+CUDA：
+
+```bash
+cargo run -p fermi-infer --release --features cuda
+```
+
+交互命令：
+- `/help` 帮助
+- `/reset` 清空上下文
+- `/exit` 退出
+
+CLI 参数：
+- `--max-new-tokens N` 生成上限（默认 1024）
+- `--repeat-penalty P` 重复惩罚（默认 1.0）
+
+## gRPC API
+
+Proto 定义：
+
+```
+crates/fermi-grpc/proto/fermi.proto
+```
+
+## 会话（简化版）
+
+当前是内存型 session，暂未实现 TTL/LRU。
+
+## 环境变量
+
+- `FERMI_MODEL` 模型 ID（默认：`Qwen/Qwen3-1.7B`）
+- `FERMI_OFFLINE=1` / `HF_HUB_OFFLINE=1` 关闭在线下载
+- `FERMI_ENGINE_POOL` HTTP 服务器实例数量
+- `FERMI_OPENAI_ADDR` HTTP 监听地址
+- `FERMI_DEFAULT_THINKING` / `FERMI_SUPPORTS_THINKING` / `FERMI_DISABLE_THINK`
+
+## 模型支持
+
+当前支持：
+- **Qwen3**（已测试 `Qwen/Qwen3-1.7B`）
+
+规划中：
+- 更多 Qwen / DeepSeek 变体
+- 量化权重（更快冷启、更低内存）
+
+## 项目定位
+
+fermi-infer 是一个 **Rust 优先、Mac 友好** 的推理栈：
+- 快速启动
+- 流式低延迟
+- 简单易部署
+
+## 路线图
+
+- KV cache / attention 性能优化
+- 吞吐与延迟基准工具
+- 更多模型后端
+- reasoning 分离（可选）
+- 可观测性与指标
+
+## 贡献指南
+
+欢迎 PR，建议流程：
+1. Fork 并创建 feature 分支
+2. 保持改动集中且清晰
+3. 运行 `cargo fmt`（可选 `cargo clippy`）
+4. 提交 PR 并附说明/日志
