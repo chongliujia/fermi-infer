@@ -2,8 +2,8 @@
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Rust](https://img.shields.io/badge/built_with-Rust-orange) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-**The Rust-native inference stack for Apple Silicon.**
-Run state-of-the-art LLMs locally with blazing fast speeds, instant startup times, and full Metal (GPU) acceleration.
+**The Rust-native inference engine for Small Language Models (SLMs).**
+Run efficient models (Qwen, SmolLM, Phi) locally with blazing fast speeds, instant startup times, and full Metal (GPU) acceleration on Apple Silicon.
 
 > **Note**: Currently optimized for **Qwen3**. Support for DeepSeek, Llama, and other architectures is on the roadmap.
 

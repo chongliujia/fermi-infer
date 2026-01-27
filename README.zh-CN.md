@@ -1,6 +1,8 @@
 # fermi-infer
 
-Rust 构建的推理栈，专注 **快速启动** 与 **快速回复**（macOS / Metal 优先），同时提供 CLI、gRPC 与 OpenAI 兼容 HTTP API。
+**专为小语言模型 (SLMs) 打造的 Rust 原生推理引擎。**
+
+在 Apple Silicon 上通过 Metal (GPU) 全加速，以极快的速度和零延迟启动运行高效模型（如 Qwen, SmolLM, Phi）。
 
 ## 文档
 
