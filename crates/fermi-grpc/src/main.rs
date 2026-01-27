@@ -4,12 +4,11 @@ use std::env;
 use std::time::Instant;
 
 use anyhow::{Error as E, Result as AnyResult};
-use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
+use candle_core::{Device};
 use fermi_grpc::fermi::fermi_server::{Fermi, FermiServer};
 use fermi_grpc::fermi::{GenerateRequest, GenerateResponse};
-use fermi_io::{download_qwen3_files, load_qwen3_config, load_tokenizer};
-use fermi_runtime::{GenerationConfig, InMemorySessionStore, Qwen3Engine, SessionId, SessionStore};
+use fermi_io::{load_tokenizer};
+use fermi_runtime::{GenerationConfig, InMemorySessionStore, InferenceEngine, ModelBuilder, SessionId, SessionStore};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -17,7 +16,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct FermiService {
-    engine_pool: Vec<Arc<Mutex<Qwen3Engine>>>,
+    engine_pool: Vec<Arc<Mutex<Box<dyn InferenceEngine>>>>,
     engine_owner: Arc<Mutex<Vec<Option<SessionId>>>>,
     device: Device,
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -31,7 +30,7 @@ struct FermiService {
 impl FermiService {
     const MAX_NEW_TOKENS: usize = 9056;
     fn new(
-        engine_pool: Vec<Arc<Mutex<Qwen3Engine>>>,
+        engine_pool: Vec<Arc<Mutex<Box<dyn InferenceEngine>>>>,
         device: Device,
         tokenizer: tokenizers::Tokenizer,
         max_position_embeddings: usize,
@@ -347,7 +346,7 @@ impl Fermi for FermiService {
                 offset_for_cache,
                 &device,
                 &gen_cfg,
-                |token_id| {
+                &mut |token_id| {
                     if timeout_ms > 0 && start_time.elapsed().as_millis() as u64 >= timeout_ms {
                         timeout_triggered = true;
                         return Ok(false);
@@ -480,22 +479,18 @@ async fn main() -> AnyResult<()> {
     let model_repo_id = env::var("FERMI_MODEL").unwrap_or_else(|_| "Qwen/Qwen3-1.7B".to_string());
     let offline = env_flag("FERMI_OFFLINE") || env_flag("HF_HUB_OFFLINE");
     println!("📥 准备模型文件: {} ...", model_repo_id);
-    let files = download_qwen3_files(&model_repo_id, !offline)?;
-    println!("⚙️ 正在解析配置文件...");
-    let config = load_qwen3_config(&files.config)?;
-    let max_position_embeddings = config.max_position_embeddings;
+    let builder = ModelBuilder::new(&model_repo_id, !offline)?;
+    let max_position_embeddings = builder.max_position_embeddings();
 
-    let dtype = if device.is_metal() { DType::F16 } else { DType::F32 };
     let pool_size = env_u64("FERMI_ENGINE_POOL").unwrap_or(1).max(1) as usize;
-    let mut engine_pool = Vec::with_capacity(pool_size);
+    let mut engine_pool: Vec<Arc<Mutex<Box<dyn InferenceEngine>>>> = Vec::with_capacity(pool_size);
     for _ in 0..pool_size {
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files.weights, dtype, &device)? };
-        let mut engine = Qwen3Engine::new(&config, vb)?;
+        let mut engine = builder.create_engine(&device)?;
         engine.clear_kv_cache();
         engine_pool.push(Arc::new(Mutex::new(engine)));
     }
 
-    let tokenizer = load_tokenizer(&files.tokenizer)?;
+    let tokenizer = load_tokenizer(builder.tokenizer_path())?;
 
     let addr = "0.0.0.0:50051".parse()?;
     let timeout_ms = env_u64("FERMI_TIMEOUT_MS").unwrap_or(60_000);

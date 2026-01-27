@@ -11,6 +11,7 @@ anyhow = "1.0"
 candle-core = "0.8.2"
 candle-nn = "0.8.2"
 fermi-models = { path = "../fermi-models" }
+fermi-io = { path = "../fermi-io" }
 rand = "0.8"
 
 [features]

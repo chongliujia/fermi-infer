@@ -18,21 +18,88 @@ pub struct PrefillOutput {
     pub current_pos: usize,
 }
 
+/// The core trait that all model engines must implement.
+/// This allows the runtime to treat different architectures (Qwen, Llama, Phi) uniformly.
+pub trait InferenceEngine: Send + Sync {
+    fn clear_kv_cache(&mut self);
+
+    fn generate_stream(
+        &mut self,
+        input_ids: &[u32],
+        device: &Device,
+        cfg: &GenerationConfig,
+        on_token: &mut dyn FnMut(u32) -> Result<bool>,
+    ) -> Result<Vec<u32>>;
+
+    fn generate_stream_with_offset(
+        &mut self,
+        input_ids: &[u32],
+        offset: usize,
+        device: &Device,
+        cfg: &GenerationConfig,
+        on_token: &mut dyn FnMut(u32) -> Result<bool>,
+    ) -> Result<Vec<u32>>;
+
+    fn append_tokens(
+        &mut self,
+        tokens: &[u32],
+        offset: usize,
+        device: &Device,
+    ) -> Result<()>;
+}
+
 // =========================================================================
-// Original Qwen3Engine (Keeping it for backward compatibility for now)
+// Original Qwen3Engine
 // =========================================================================
 pub struct Qwen3Engine {
     model: Qwen3Model,
+}
+
+impl InferenceEngine for Qwen3Engine {
+    fn clear_kv_cache(&mut self) {
+        self.model.clear_kv_cache();
+    }
+
+    fn generate_stream(
+        &mut self,
+        input_ids: &[u32],
+        device: &Device,
+        cfg: &GenerationConfig,
+        on_token: &mut dyn FnMut(u32) -> Result<bool>,
+    ) -> Result<Vec<u32>> {
+        self.generate_stream_internal(input_ids, device, cfg, on_token)
+    }
+
+    fn generate_stream_with_offset(
+        &mut self,
+        input_ids: &[u32],
+        offset: usize,
+        device: &Device,
+        cfg: &GenerationConfig,
+        on_token: &mut dyn FnMut(u32) -> Result<bool>,
+    ) -> Result<Vec<u32>> {
+        self.generate_stream_with_offset_internal(input_ids, offset, device, cfg, on_token)
+    }
+
+    fn append_tokens(
+        &mut self,
+        tokens: &[u32],
+        offset: usize,
+        device: &Device,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let input_tensor = Tensor::new(tokens, device)?.unsqueeze(0)?;
+        let _ = self.model.forward(&input_tensor, offset)?;
+        Ok(())
+    }
 }
 
 impl Qwen3Engine {
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let model = Qwen3Model::new(config, vb)?;
         Ok(Self { model })
-    }
-
-    pub fn clear_kv_cache(&mut self) {
-        self.model.clear_kv_cache();
     }
 
     pub fn prefill(
@@ -84,7 +151,9 @@ impl Qwen3Engine {
         sample_token(&last_token_logits, cfg, generated_ids, &mut rng)
     }
 
-    pub fn generate_stream<F>(
+    // Renamed to internal to avoid conflict/confusion, though overloading isn't possible in Rust like this.
+    // Actually, keeping the name `generate_stream_internal` for the generic version is cleaner.
+    pub fn generate_stream_internal<F>(
         &mut self,
         input_ids: &[u32],
         device: &Device,
@@ -127,6 +196,53 @@ impl Qwen3Engine {
 
         Ok(generated_ids)
     }
+
+    pub fn generate_stream_with_offset_internal<F>(
+        &mut self,
+        input_ids: &[u32],
+        offset: usize,
+        device: &Device,
+        cfg: &GenerationConfig,
+        mut on_token: F,
+    ) -> Result<Vec<u32>>
+    where
+        F: FnMut(u32) -> Result<bool>,
+    {
+        if cfg.max_new_tokens == 0 {
+            return Ok(Vec::new());
+        }
+
+        let prefill = self.prefill_with_offset(input_ids, offset, device, cfg)?;
+        let mut next_token_id = prefill.next_token_id;
+        let mut generated_ids = prefill.generated_ids;
+        let mut current_pos = prefill.current_pos;
+        if !on_token(next_token_id)? {
+            return Ok(generated_ids);
+        }
+
+        if cfg.stop_tokens.contains(&next_token_id) {
+            return Ok(generated_ids);
+        }
+
+        for _ in 0..cfg.max_new_tokens {
+            next_token_id =
+                self.decode_step(next_token_id, current_pos, &generated_ids, device, cfg)?;
+            generated_ids.push(next_token_id);
+            if !on_token(next_token_id)? {
+                break;
+            }
+
+            if cfg.stop_tokens.contains(&next_token_id) {
+                break;
+            }
+
+            current_pos += 1;
+        }
+
+        Ok(generated_ids)
+    }
+
+
 
     pub fn generate_stream_with_offset<F>(
         &mut self,
@@ -200,7 +316,7 @@ impl Qwen3Engine {
         F: FnMut(u32) -> Result<bool>,
     {
         let _state = session_store.get_or_create(session_id.clone());
-        let out = self.generate_stream(input_ids, device, cfg, on_token)?;
+        let out = self.generate_stream_internal(input_ids, device, cfg, on_token)?;
         session_store.touch(&session_id);
         Ok(out)
     }

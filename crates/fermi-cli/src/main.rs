@@ -1,8 +1,7 @@
 use anyhow::{Error as E, Result};
-use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
-use fermi_io::{download_qwen3_files, load_qwen3_config, load_tokenizer};
-use fermi_runtime::{GenerationConfig, Qwen3Engine};
+use candle_core::{Device};
+use fermi_io::{load_tokenizer};
+use fermi_runtime::{GenerationConfig, ModelBuilder};
 use tokenizers::Tokenizer;
 use std::env;
 use std::io::{self, Write};
@@ -25,24 +24,14 @@ fn main() -> Result<()> {
     
     println!("📥 准备模型文件...");
     println!("📦 模型: {}", model_repo_id);
-    let files = download_qwen3_files(&model_repo_id, !cli_cfg.offline)?;
-    println!("📥 检测到模型为分片格式，开始下载权重...");
-    println!("✅ 权重下载完成");
+    
+    let builder = ModelBuilder::new(&model_repo_id, !cli_cfg.offline)?;
 
-    println!("⚙️ 正在解析配置文件...");
-    let config = load_qwen3_config(&files.config)?;
-    if config.sliding_window.is_some() {
-        println!("⚠️  Config 修复: 将 'sliding_window' 设为 {}", config.max_position_embeddings);
-    }
-
-    // 5. 加载权重
-    let dtype = if device.is_metal() { DType::F16 } else { DType::F32 };
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files.weights, dtype, &device)? };
-
-    // 6. 初始化模型 (使用自定义的 Qwen3Model)
-    println!("🏗️ 正在构建模型架构 (Custom Qwen3 No-Bias)...");
-    let mut engine = Qwen3Engine::new(&config, vb)?;
-    let tokenizer = load_tokenizer(&files.tokenizer)?;
+    println!("✅ 权重下载/验证完成");
+    println!("⚙️ 正在初始化推理引擎...");
+    
+    let mut engine = builder.create_engine(&device)?;
+    let tokenizer = load_tokenizer(builder.tokenizer_path())?;
     engine.clear_kv_cache();
 
     println!("💬 交互模式：输入问题，回车发送。命令：/help /reset /exit");
@@ -66,7 +55,7 @@ fn main() -> Result<()> {
         temperature: cli_cfg.temperature,
         top_p: cli_cfg.top_p,
     };
-    let max_ctx = config.max_position_embeddings;
+    let max_ctx = builder.max_position_embeddings();
     let timeout_ms = cli_cfg.timeout_ms;
 
     loop {
@@ -106,7 +95,7 @@ fn main() -> Result<()> {
         let expected_max = offset + input_ids.len() + gen_cfg.max_new_tokens + 8;
         if expected_max > max_ctx {
             let pairs = history_pairs(&history);
-            let (trunc_ids, kept_pairs) =
+            let (trunc_ids, kept_pairs) = 
                 build_truncated_prompt(&pairs, line, &tokenizer, max_ctx, gen_cfg.max_new_tokens)?;
             if trunc_ids.len() >= max_ctx {
                 println!("⚠️ 输入过长，已超过最大上下文 {} tokens", max_ctx);
@@ -138,12 +127,13 @@ fn main() -> Result<()> {
         let mut timeout_triggered = false;
         let start_time = Instant::now();
 
+        // Pass a mutable closure to the trait method
         let generated = engine.generate_stream_with_offset(
             &input_ids,
             offset,
             &device,
             &gen_cfg,
-            |token_id| {
+            &mut |token_id| {
                 if timeout_ms > 0 && start_time.elapsed().as_millis() as u64 >= timeout_ms {
                     timeout_triggered = true;
                     return Ok(false);

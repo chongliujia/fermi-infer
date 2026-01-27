@@ -184,7 +184,7 @@ def build_ui():
 
             with gr.Column(scale=1, min_width=240):
                 with gr.Accordion("Settings", open=False):
-                    api_base = gr.Textbox(label="OpenAI Base URL", value="http://127.0.0.1:8000")
+                    api_base = gr.Textbox(label="OpenAI Base URL", value="http://127.0.0.1:8080")
                     api_key = gr.Textbox(label="API Key (optional)", value="", type="password")
                     system_prompt = gr.Textbox(
                         label="System Prompt",

@@ -15,10 +15,9 @@ use axum::{
 use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Bearer;
-use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
-use fermi_io::{download_qwen3_files, load_qwen3_config, load_tokenizer};
-use fermi_runtime::{GenerationConfig, Qwen3Engine};
+use candle_core::Device;
+use fermi_io::{load_tokenizer};
+use fermi_runtime::{GenerationConfig, InferenceEngine, ModelBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{mpsc, Semaphore};
@@ -32,7 +31,7 @@ const DEFAULT_MAX_TOKENS: usize = 256;
 const MAX_NEW_TOKENS: usize = 9056;
 
 struct AppState {
-    engines: Vec<Arc<Mutex<Qwen3Engine>>>,
+    engines: Vec<Arc<Mutex<Box<dyn InferenceEngine>>>>,
     next_engine: AtomicUsize,
     semaphore: Arc<Semaphore>,
     tokenizer: Arc<Tokenizer>,
@@ -163,20 +162,19 @@ async fn main() -> AnyResult<()> {
     let disable_think = env_flag("FERMI_DISABLE_THINK");
 
     info!("model: {}", model_id);
-    let files = download_qwen3_files(&model_id, !offline)?;
-    let config = load_qwen3_config(&files.config)?;
+    
+    // Initialize ModelBuilder
+    let builder = ModelBuilder::new(&model_id, !offline)?;
 
-    let dtype = if device.is_metal() { DType::F16 } else { DType::F32 };
     let pool_size = env_u64("FERMI_ENGINE_POOL").unwrap_or(1).max(1) as usize;
-    let mut engines = Vec::with_capacity(pool_size);
+    let mut engines: Vec<Arc<Mutex<Box<dyn InferenceEngine>>>> = Vec::with_capacity(pool_size);
     for _ in 0..pool_size {
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files.weights, dtype, &device)? };
-        let mut engine = Qwen3Engine::new(&config, vb)?;
+        let mut engine = builder.create_engine(&device)?;
         engine.clear_kv_cache();
         engines.push(Arc::new(Mutex::new(engine)));
     }
 
-    let tokenizer = Arc::new(load_tokenizer(&files.tokenizer)?);
+    let tokenizer = Arc::new(load_tokenizer(builder.tokenizer_path())?);
     let stop_tokens = build_stop_tokens(tokenizer.as_ref());
     let semaphore = Arc::new(Semaphore::new(pool_size));
 
@@ -188,7 +186,7 @@ async fn main() -> AnyResult<()> {
         device,
         stop_tokens,
         model_id: model_id.clone(),
-        max_position_embeddings: config.max_position_embeddings,
+        max_position_embeddings: builder.max_position_embeddings(),
         disable_think,
     };
 
@@ -412,7 +410,7 @@ async fn run_inference(state: Arc<AppState>, prompt: String, cfg: GenerationConf
 
         let mut utf8 = Utf8Buffer::new();
         let mut out = String::new();
-        let generated = engine.generate_stream(&input_ids, &device, &cfg, |token_id| {
+        let generated = engine.generate_stream(&input_ids, &device, &cfg, &mut |token_id| {
             if let Some(text) = utf8.push_and_decode(token_id, &tokenizer)? {
                 out.push_str(&text);
             }
@@ -476,7 +474,7 @@ async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig
         let input_ids = tokens.get_ids().to_vec();
         let mut utf8 = Utf8Buffer::new();
 
-        let result = engine.generate_stream(&input_ids, &device, &cfg, |token_id| {
+        let result = engine.generate_stream(&input_ids, &device, &cfg, &mut |token_id| {
             if let Some(text) = utf8.push_and_decode(token_id, &tokenizer)? {
                 let chunk = json!({
                     "id": id,
@@ -519,7 +517,9 @@ async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig
     });
 
     let stream = ReceiverStream::new(rx).map(|evt| evt);
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationConfig) -> Response {
@@ -560,7 +560,7 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
         let input_ids = tokens.get_ids().to_vec();
         let mut utf8 = Utf8Buffer::new();
 
-        let result = engine.generate_stream(&input_ids, &device, &cfg, |token_id| {
+        let result = engine.generate_stream(&input_ids, &device, &cfg, &mut |token_id| {
             if let Some(text) = utf8.push_and_decode(token_id, &tokenizer)? {
                 let chunk = json!({
                     "id": id,
@@ -605,7 +605,9 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
     });
 
     let stream = ReceiverStream::new(rx).map(|evt| evt);
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 fn build_prompt(messages: &[ChatMessage], think_mode: ThinkingMode) -> String {
@@ -719,7 +721,7 @@ fn extract_content(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn next_engine(state: &AppState) -> Arc<Mutex<Qwen3Engine>> {
+fn next_engine(state: &AppState) -> Arc<Mutex<Box<dyn InferenceEngine>>> {
     let idx = state.next_engine.fetch_add(1, Ordering::Relaxed) % state.engines.len();
     Arc::clone(&state.engines[idx])
 }

@@ -848,6 +848,7 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
+ "fermi-io",
  "fermi-models",
  "rand 0.8.5",
 ]
