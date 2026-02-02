@@ -1,26 +1,32 @@
 use anyhow::{Error as E, Result};
-use fermi_models::qwen3::Config;
+use fermi_models::{phi3::Config as Phi3Config, qwen3::Config as QwenConfig};
 use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-pub struct Qwen3Files {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelArch {
+    Qwen,
+    Phi3,
+}
+
+pub struct ModelFiles {
     pub tokenizer: PathBuf,
     pub config: PathBuf,
     pub weights: Vec<PathBuf>,
 }
 
-pub fn download_qwen3_files(model_repo_id: &str, allow_network: bool) -> Result<Qwen3Files> {
+pub fn download_model_files(model_repo_id: &str, allow_network: bool) -> Result<ModelFiles> {
     if let Ok(dir) = std::env::var("FERMI_MODEL_DIR") {
-        if let Some(files) = try_local_qwen3_files(Path::new(&dir))? {
+        if let Some(files) = try_local_model_files(Path::new(&dir))? {
             return Ok(files);
         }
     }
-    if let Some(files) = try_local_qwen3_files(Path::new(model_repo_id))? {
+    if let Some(files) = try_local_model_files(Path::new(model_repo_id))? {
         return Ok(files);
     }
-    if let Some(files) = try_hf_cache_qwen3_files(model_repo_id)? {
+    if let Some(files) = try_hf_cache_model_files(model_repo_id)? {
         return Ok(files);
     }
 
@@ -57,14 +63,14 @@ pub fn download_qwen3_files(model_repo_id: &str, allow_network: bool) -> Result<
         ));
     };
 
-    Ok(Qwen3Files {
+    Ok(ModelFiles {
         tokenizer,
         config,
         weights,
     })
 }
 
-fn try_hf_cache_qwen3_files(model_repo_id: &str) -> Result<Option<Qwen3Files>> {
+fn try_hf_cache_model_files(model_repo_id: &str) -> Result<Option<ModelFiles>> {
     let cache = Cache::from_env();
     let repo = cache.repo(Repo::new(model_repo_id.to_string(), RepoType::Model));
 
@@ -96,14 +102,14 @@ fn try_hf_cache_qwen3_files(model_repo_id: &str) -> Result<Option<Qwen3Files>> {
         return Ok(None);
     };
 
-    Ok(Some(Qwen3Files {
+    Ok(Some(ModelFiles {
         tokenizer,
         config,
         weights,
     }))
 }
 
-fn try_local_qwen3_files(dir: &Path) -> Result<Option<Qwen3Files>> {
+fn try_local_model_files(dir: &Path) -> Result<Option<ModelFiles>> {
     if !dir.is_dir() {
         return Ok(None);
     }
@@ -126,7 +132,7 @@ fn try_local_qwen3_files(dir: &Path) -> Result<Option<Qwen3Files>> {
         shards
     };
 
-    Ok(Some(Qwen3Files {
+    Ok(Some(ModelFiles {
         tokenizer,
         config,
         weights,
@@ -199,7 +205,41 @@ pub fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
     Tokenizer::from_file(path).map_err(E::msg)
 }
 
-pub fn load_qwen3_config(path: impl AsRef<Path>) -> Result<Config> {
+pub fn detect_model_arch(path: impl AsRef<Path>) -> Result<ModelArch> {
+    let config_content = std::fs::read_to_string(path)?;
+    let config_value: serde_json::Value = serde_json::from_str(&config_content)?;
+    let model_type = config_value
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_ascii_lowercase());
+    if let Some(mt) = model_type {
+        if mt.starts_with("qwen") {
+            return Ok(ModelArch::Qwen);
+        }
+        if mt.starts_with("phi") {
+            return Ok(ModelArch::Phi3);
+        }
+    }
+
+    if let Some(archs) = config_value.get("architectures").and_then(|v| v.as_array()) {
+        for arch in archs {
+            let Some(name) = arch.as_str() else {
+                continue;
+            };
+            let lowered = name.to_ascii_lowercase();
+            if lowered.contains("qwen") {
+                return Ok(ModelArch::Qwen);
+            }
+            if lowered.contains("phi") {
+                return Ok(ModelArch::Phi3);
+            }
+        }
+    }
+
+    Err(E::msg("unsupported model architecture in config.json"))
+}
+
+pub fn load_qwen_config(path: impl AsRef<Path>) -> Result<QwenConfig> {
     let config_content = std::fs::read_to_string(path)?;
     let mut config_value: serde_json::Value = serde_json::from_str(&config_content)?;
 
@@ -208,6 +248,24 @@ pub fn load_qwen3_config(path: impl AsRef<Path>) -> Result<Config> {
             .get("max_position_embeddings")
             .and_then(|v| v.as_u64())
             .unwrap_or(32768);
+        if obj.get("num_key_value_heads").is_none()
+            && let Some(v) = obj.get("num_attention_heads").cloned()
+        {
+            obj.insert("num_key_value_heads".to_string(), v);
+        }
+        if obj.get("head_dim").is_none() {
+            let hidden = obj.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(0);
+            let heads = obj
+                .get("num_attention_heads")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1);
+            if hidden > 0 && heads > 0 {
+                obj.insert(
+                    "head_dim".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(hidden / heads)),
+                );
+            }
+        }
 
         if let Some(sw) = obj.get("sliding_window") {
             if sw.is_null() {
@@ -219,8 +277,30 @@ pub fn load_qwen3_config(path: impl AsRef<Path>) -> Result<Config> {
         }
     }
 
-    let config: Config = serde_json::from_value(config_value)?;
+    let config: QwenConfig = serde_json::from_value(config_value)?;
     Ok(config)
+}
+
+pub fn load_phi3_config(path: impl AsRef<Path>) -> Result<Phi3Config> {
+    let config_content = std::fs::read_to_string(path)?;
+    let mut config_value: serde_json::Value = serde_json::from_str(&config_content)?;
+    if let Some(obj) = config_value.as_object_mut() {
+        if obj.get("num_key_value_heads").is_none()
+            && let Some(v) = obj.get("num_attention_heads").cloned()
+        {
+            obj.insert("num_key_value_heads".to_string(), v);
+        }
+    }
+    let config: Phi3Config = serde_json::from_value(config_value)?;
+    Ok(config)
+}
+
+pub fn download_qwen3_files(model_repo_id: &str, allow_network: bool) -> Result<ModelFiles> {
+    download_model_files(model_repo_id, allow_network)
+}
+
+pub fn load_qwen3_config(path: impl AsRef<Path>) -> Result<QwenConfig> {
+    load_qwen_config(path)
 }
 
 #[cfg(test)]
@@ -301,11 +381,19 @@ mod tests {
         fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").expect("write shard2");
         fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").expect("write shard1");
 
-        let files = try_local_qwen3_files(dir.path())
+        let files = try_local_model_files(dir.path())
             .expect("scan local files")
             .expect("should find files");
         assert_eq!(files.weights.len(), 2);
         assert!(files.weights[0].ends_with("model-00001-of-00002.safetensors"));
         assert!(files.weights[1].ends_with("model-00002-of-00002.safetensors"));
+    }
+
+    #[test]
+    fn detects_model_arch_from_model_type() {
+        let dir = TempDir::new("fermi-io-arch");
+        fs::write(dir.path().join("config.json"), br#"{"model_type":"phi3"}"#).expect("config");
+        let arch = detect_model_arch(dir.path().join("config.json")).expect("detect arch");
+        assert_eq!(arch, ModelArch::Phi3);
     }
 }

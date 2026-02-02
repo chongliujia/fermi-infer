@@ -215,6 +215,7 @@ async fn main() -> AnyResult<()> {
 
     // Initialize ModelBuilder
     let builder = ModelBuilder::new(&model_id, !offline)?;
+    info!("detected architecture: {:?}", builder.model_arch());
     let sampling_defaults =
         sampling_defaults_from_sources(app_cfg.generation.to_sampling_overrides())?;
 

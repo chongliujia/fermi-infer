@@ -642,6 +642,7 @@ async fn main() -> AnyResult<()> {
         .unwrap_or(false);
     println!("📥 准备模型文件: {} ...", model_repo_id);
     let builder = ModelBuilder::new(&model_repo_id, !offline)?;
+    println!("🧠 模型架构: {:?}", builder.model_arch());
     let max_position_embeddings = builder.max_position_embeddings();
 
     let pool_size = env_u64("FERMI_ENGINE_POOL")

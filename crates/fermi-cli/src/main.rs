@@ -41,6 +41,7 @@ fn main() -> Result<()> {
     println!("📦 模型: {}", model_repo_id);
 
     let builder = ModelBuilder::new(&model_repo_id, !offline)?;
+    println!("🧠 架构: {:?}", builder.model_arch());
     let sampling_defaults =
         sampling_defaults_from_sources(app_cfg.generation.to_sampling_overrides())?;
     let sampling = resolve_sampling_params(

@@ -3,9 +3,9 @@
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Rust](https://img.shields.io/badge/built_with-Rust-orange) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 **The Rust-native inference engine for Small Language Models (SLMs).**
-Run efficient models (Qwen, SmolLM, Phi) locally with blazing fast speeds, instant startup times, and full Metal (GPU) acceleration on Apple Silicon.
+Run efficient models (Qwen, Phi, SmolLM) locally with blazing fast speeds, instant startup times, and full Metal (GPU) acceleration on Apple Silicon.
 
-> **Note**: Currently optimized for **Qwen3**. Support for DeepSeek, Llama, and other architectures is on the roadmap.
+> **Note**: Core runtime now supports **Qwen family (Qwen2.5/Qwen3)** and **Phi-3 style** architectures.
 
 ## ✨ Why Fermi Infer?
 
@@ -44,15 +44,15 @@ cargo run -p fermi-openai --release --features metal
 
 Fermi Infer focuses on highly optimized pipelines for **efficient small models** running on consumer hardware (Mac M-series, Single RTX 3090).
 
-- [x] **Qwen3**
+- [x] **Qwen Family (Qwen2.5 / Qwen3)**
     - Recommended: `Qwen/Qwen3-1.7B` (Ultra-low latency)
-    - Target: 0.5B - 7B variants
+    - Also supported: Qwen2.5 CausalLM checkpoints with safetensors layout
+- [x] **Phi-3 Style**
+    - Target: Phi-3/Phi-3.5 style CausalLM checkpoints (safetensors)
 - [ ] **DeepSeek-R1 (Distill)**
     - Target: `DeepSeek-R1-Distill-Qwen-1.5B` / `7B`
 - [ ] **SmolLM2** (Hugging Face)
     - Target: 135M / 360M / 1.7B - Perfect for ultra-fast local inference
-- [ ] **Phi-3.5** (Microsoft)
-    - Target: Mini (3.8B) - High reasoning capability
 - [ ] **Gemma 2** (Google)
     - Target: 2B / 9B - Efficient lightweight models
 
@@ -90,7 +90,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 `fermi-infer` is designed as a modular workspace:
 
 *   **`crates/fermi-runtime`**: The high-performance inference engine (KV-cache, prefill/decode).
-*   **`crates/fermi-models`**: Architecture implementations (currently Qwen3).
+*   **`crates/fermi-models`**: Architecture implementations (Qwen, Phi-3 style).
 *   **`crates/fermi-grpc`**: Microservices-ready gRPC streaming server.
 *   **`crates/fermi-openai`**: HTTP layer compatible with OpenAI clients.
 *   **`crates/fermi-cli`**: The user-facing terminal interface.
@@ -98,6 +98,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ## 📦 Configuration
 
 Fermi now supports a single config file (`fermi.toml`) with env/CLI overrides.
+Model architecture is auto-detected from `config.json` (`model_type`/`architectures`).
 
 Auto-discovery order:
 *   `--config PATH` (CLI only)

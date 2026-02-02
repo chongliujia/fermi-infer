@@ -6,21 +6,18 @@ use serde::Deserialize;
 pub struct Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
-    pub head_dim: usize,
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
-    #[allow(dead_code)]
-    pub sliding_window: Option<usize>,
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
 }
 
 impl Config {
     pub fn head_dim(&self) -> usize {
-        self.head_dim
+        self.hidden_size / self.num_attention_heads
     }
 }
 
@@ -61,12 +58,8 @@ impl RotaryEmbedding {
 }
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    qkv_proj: Linear,
     o_proj: Linear,
-    q_norm: Option<candle_nn::RmsNorm>,
-    k_norm: Option<candle_nn::RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -86,39 +79,15 @@ impl Attention {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim();
+        let qkv_width = (num_heads + 2 * num_kv_heads) * head_dim;
 
-        let q_proj = linear_no_bias(hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+        let qkv_proj = linear_no_bias(hidden_size, qkv_width, vb.pp("qkv_proj"))?;
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
-        let q_norm = if vb.contains_tensor("q_norm.weight") {
-            Some(candle_nn::rms_norm(
-                head_dim,
-                cfg.rms_norm_eps,
-                vb.pp("q_norm"),
-            )?)
-        } else {
-            None
-        };
-        let k_norm = if vb.contains_tensor("k_norm.weight") {
-            Some(candle_nn::rms_norm(
-                head_dim,
-                cfg.rms_norm_eps,
-                vb.pp("k_norm"),
-            )?)
-        } else {
-            None
-        };
-
         let rotary_emb = RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
-            q_norm,
-            k_norm,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -138,29 +107,22 @@ impl Attention {
             self.clear_cache();
         }
 
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let qkv = self.qkv_proj.forward(x)?;
+        let qkv = qkv.reshape((
+            b,
+            seq_len,
+            self.num_heads + 2 * self.num_kv_heads,
+            self.head_dim,
+        ))?;
 
-        let q = q
-            .reshape((b, seq_len, self.num_heads, self.head_dim))?
+        let q = qkv.narrow(2, 0, self.num_heads)?.transpose(1, 2)?;
+        let k = qkv
+            .narrow(2, self.num_heads, self.num_kv_heads)?
             .transpose(1, 2)?;
-        let k = k
-            .reshape((b, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, seq_len, self.num_kv_heads, self.head_dim))?
+        let v = qkv
+            .narrow(2, self.num_heads + self.num_kv_heads, self.num_kv_heads)?
             .transpose(1, 2)?
             .contiguous()?;
-
-        let q = match &self.q_norm {
-            Some(norm) => norm.forward(&q)?,
-            None => q,
-        };
-        let k = match &self.k_norm {
-            Some(norm) => norm.forward(&k)?,
-            None => k,
-        };
 
         let (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offset)?;
 
@@ -273,13 +235,12 @@ impl Attention {
             self.cache_v_tail = Some(new_v);
             self.cache_len += take;
 
-            if cur_len + take == Self::KV_CHUNK_SIZE {
-                if let (Some(k_full), Some(v_full)) =
+            if cur_len + take == Self::KV_CHUNK_SIZE
+                && let (Some(k_full), Some(v_full)) =
                     (self.cache_k_tail.take(), self.cache_v_tail.take())
-                {
-                    self.cache_k.push(k_full);
-                    self.cache_v.push(v_full);
-                }
+            {
+                self.cache_k.push(k_full);
+                self.cache_v.push(v_full);
             }
 
             start += take;
@@ -366,9 +327,9 @@ impl Attention {
 }
 
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
+    gate_up_proj: Linear,
     down_proj: Linear,
+    intermediate_size: usize,
 }
 
 impl Mlp {
@@ -376,22 +337,21 @@ impl Mlp {
         let hidden = cfg.hidden_size;
         let intermediate = cfg.intermediate_size;
 
-        let gate_proj = linear_no_bias(hidden, intermediate, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden, intermediate, vb.pp("up_proj"))?;
+        let gate_up_proj = linear_no_bias(hidden, 2 * intermediate, vb.pp("gate_up_proj"))?;
         let down_proj = linear_no_bias(intermediate, hidden, vb.pp("down_proj"))?;
 
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
+            intermediate_size: intermediate,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_gate = self.gate_proj.forward(x)?;
-        let x_gate = candle_nn::ops::silu(&x_gate)?;
-        let x_up = self.up_proj.forward(x)?;
-        let x = (x_gate * x_up)?;
+        let fused = self.gate_up_proj.forward(x)?;
+        let gate = fused.narrow(2, 0, self.intermediate_size)?;
+        let up = fused.narrow(2, self.intermediate_size, self.intermediate_size)?;
+        let x = (candle_nn::ops::silu(&gate)? * up)?;
         self.down_proj.forward(&x)
     }
 }
@@ -440,14 +400,14 @@ impl Block {
     }
 }
 
-pub struct Qwen3Model {
+pub struct Phi3Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<Block>,
     norm: candle_nn::RmsNorm,
     lm_head: Linear,
 }
 
-impl Qwen3Model {
+impl Phi3Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;

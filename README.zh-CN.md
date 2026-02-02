@@ -2,7 +2,7 @@
 
 **专为小语言模型 (SLMs) 打造的 Rust 原生推理引擎。**
 
-在 Apple Silicon 上通过 Metal (GPU) 全加速，以极快的速度和零延迟启动运行高效模型（如 Qwen, SmolLM, Phi）。
+在 Apple Silicon 上通过 Metal (GPU) 全加速，以极快的速度和零延迟启动运行高效模型（如 Qwen、Phi、SmolLM）。
 
 ## 文档
 
@@ -113,6 +113,7 @@ crates/fermi-grpc/proto/fermi.proto
 ## 环境变量
 
 推荐优先使用 `fermi.toml` 统一配置，再用环境变量做覆盖。
+模型架构会通过 `config.json`（`model_type` / `architectures`）自动识别。
 
 自动发现顺序：
 - CLI `--config PATH`（仅 CLI）
@@ -189,7 +190,11 @@ disable_think = false
 ## 模型支持
 
 当前支持：
-- **Qwen3**（已测试 `Qwen/Qwen3-1.7B`）
+- **Qwen 系列（Qwen2.5 / Qwen3）**
+  - 已测试：`Qwen/Qwen3-1.7B`
+  - 支持：Qwen2.5 CausalLM safetensors 布局
+- **Phi-3 风格架构**
+  - 支持 Phi-3 / Phi-3.5 风格 CausalLM safetensors 布局
 
 规划中：
 - 更多 Qwen / DeepSeek 变体
