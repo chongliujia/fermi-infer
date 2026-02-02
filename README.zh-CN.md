@@ -115,6 +115,15 @@ crates/fermi-grpc/proto/fermi.proto
 - `FERMI_ENGINE_POOL` HTTP 服务器实例数量
 - `FERMI_OPENAI_ADDR` HTTP 监听地址
 - `FERMI_DEFAULT_THINKING` / `FERMI_SUPPORTS_THINKING` / `FERMI_DISABLE_THINK`
+- `FERMI_SESSION_TTL_MS` gRPC 会话空闲 TTL（毫秒，未设置或 `0` 表示关闭）
+- `FERMI_SESSION_MAX` gRPC 内存会话上限（超过后按 LRU 回收）
+
+## API 兼容性说明
+
+- OpenAI 接口错误返回统一为 `{"error": {...}}` JSON 结构（不再返回裸字符串）。
+- `finish_reason` 语义更准确：
+  - 命中 stop token 时返回 `stop`
+  - 达到 `max_*_tokens` 上限时返回 `length`
 
 ## 模型支持
 

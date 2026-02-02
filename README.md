@@ -102,6 +102,15 @@ Configure via Environment Variables:
 *   `FERMI_MODEL`: Change the model ID (e.g., `export FERMI_MODEL=Qwen/Qwen3-3B`).
 *   `FERMI_ENGINE_POOL`: Number of concurrent model instances (HTTP server).
 *   `FERMI_OFFLINE=1`: Disable HuggingFace downloads (offline mode).
+*   `FERMI_SESSION_TTL_MS`: gRPC session idle TTL in milliseconds (`0`/unset means disabled).
+*   `FERMI_SESSION_MAX`: gRPC max in-memory sessions before LRU eviction.
+
+## 🔧 API Compatibility Notes
+
+*   OpenAI-style errors now return `{"error": {...}}` JSON objects (instead of plain strings).
+*   `finish_reason` is more precise:
+    * `stop` when a stop token is hit.
+    * `length` when generation reaches `max_*_tokens`.
 
 ## 🗺️ Roadmap
 

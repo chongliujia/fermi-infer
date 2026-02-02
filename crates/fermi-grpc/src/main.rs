@@ -1,14 +1,16 @@
+use std::env;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::env;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Error as E, Result as AnyResult};
-use candle_core::{Device};
+use candle_core::Device;
 use fermi_grpc::fermi::fermi_server::{Fermi, FermiServer};
 use fermi_grpc::fermi::{GenerateRequest, GenerateResponse};
-use fermi_io::{load_tokenizer};
-use fermi_runtime::{GenerationConfig, InMemorySessionStore, InferenceEngine, ModelBuilder, SessionId, SessionStore};
+use fermi_io::load_tokenizer;
+use fermi_runtime::{
+    GenerationConfig, InMemorySessionStore, InferenceEngine, ModelBuilder, SessionId, SessionStore,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -27,6 +29,38 @@ struct FermiService {
     disable_think: bool,
 }
 
+fn release_session_binding(
+    engine_owner: &Arc<Mutex<Vec<Option<SessionId>>>>,
+    sessions: &Arc<InMemorySessionStore>,
+    session_id: &SessionId,
+    engine_id: usize,
+) {
+    if let Ok(mut owners) = engine_owner.lock() {
+        owners[engine_id] = None;
+    }
+    sessions.release(session_id);
+}
+
+fn clear_engine_owner(
+    owners: &mut [Option<SessionId>],
+    session_id: &str,
+    preferred_engine_id: Option<usize>,
+) {
+    if let Some(engine_id) = preferred_engine_id {
+        if let Some(slot) = owners.get_mut(engine_id) {
+            if slot.as_deref() == Some(session_id) {
+                *slot = None;
+                return;
+            }
+        }
+    }
+    for slot in owners {
+        if slot.as_deref() == Some(session_id) {
+            *slot = None;
+        }
+    }
+}
+
 impl FermiService {
     const MAX_NEW_TOKENS: usize = 9056;
     fn new(
@@ -35,6 +69,8 @@ impl FermiService {
         tokenizer: tokenizers::Tokenizer,
         max_position_embeddings: usize,
         timeout_ms: u64,
+        session_ttl_ms: Option<u64>,
+        session_max: Option<usize>,
         default_system_prompt: Option<String>,
         disable_think: bool,
     ) -> Self {
@@ -44,7 +80,10 @@ impl FermiService {
             engine_owner: Arc::new(Mutex::new(engine_owner)),
             device,
             tokenizer: Arc::new(tokenizer),
-            sessions: Arc::new(InMemorySessionStore::new()),
+            sessions: Arc::new(InMemorySessionStore::new_with_limits(
+                session_ttl_ms.map(Duration::from_millis),
+                session_max,
+            )),
             max_position_embeddings,
             timeout_ms,
             default_system_prompt,
@@ -79,11 +118,7 @@ impl FermiService {
         } else {
             req.temperature
         };
-        let top_p = if req.top_p <= 0.0 {
-            0.95
-        } else {
-            req.top_p
-        };
+        let top_p = if req.top_p <= 0.0 { 0.95 } else { req.top_p };
 
         GenerationConfig {
             max_new_tokens,
@@ -101,9 +136,10 @@ impl FermiService {
             }
         }
 
-        let mut owners = self.engine_owner.lock().map_err(|_| {
-            Status::internal("engine owner mutex poisoned")
-        })?;
+        let mut owners = self
+            .engine_owner
+            .lock()
+            .map_err(|_| Status::internal("engine owner mutex poisoned"))?;
         if let Some((idx, slot)) = owners
             .iter_mut()
             .enumerate()
@@ -124,6 +160,17 @@ impl FermiService {
         ))
     }
 
+    fn gc_sessions(&self) {
+        let evicted = self.sessions.gc_collect();
+        if evicted.is_empty() {
+            return;
+        }
+        if let Ok(mut owners) = self.engine_owner.lock() {
+            for event in evicted {
+                clear_engine_owner(&mut owners, &event.session_id, event.engine_id);
+            }
+        }
+    }
 }
 
 fn build_effective_system_prompt(
@@ -215,14 +262,30 @@ fn build_truncated_prompt(
 
 #[tonic::async_trait]
 impl Fermi for FermiService {
-    type GenerateStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = std::result::Result<GenerateResponse, Status>> + Send>>;
+    type GenerateStream = Pin<
+        Box<dyn tokio_stream::Stream<Item = std::result::Result<GenerateResponse, Status>> + Send>,
+    >;
 
     async fn generate(
         &self,
         request: Request<GenerateRequest>,
     ) -> std::result::Result<Response<Self::GenerateStream>, Status> {
+        struct InflightGuard {
+            sessions: Arc<InMemorySessionStore>,
+            session_id: SessionId,
+            enabled: bool,
+        }
+        impl Drop for InflightGuard {
+            fn drop(&mut self) {
+                if self.enabled {
+                    self.sessions.end(&self.session_id);
+                }
+            }
+        }
+
         let req = request.into_inner();
+        self.gc_sessions();
+        let ephemeral_session = req.session_id.is_empty();
         let session_id = if req.session_id.is_empty() {
             Uuid::new_v4().to_string()
         } else {
@@ -234,6 +297,11 @@ impl Fermi for FermiService {
                 "session is busy; concurrent requests are not supported",
             ));
         }
+        let mut inflight_guard = InflightGuard {
+            sessions: Arc::clone(&self.sessions),
+            session_id: session_id.clone(),
+            enabled: true,
+        };
         let state = self.sessions.get_or_create(session_id.clone());
         let mut history = state.history;
         let mut has_context = state.has_context;
@@ -272,6 +340,12 @@ impl Fermi for FermiService {
             )?;
             if trunc_ids.len() >= self.max_position_embeddings {
                 self.sessions.end(&session_id);
+                if ephemeral_session {
+                    if let Ok(mut owners) = self.engine_owner.lock() {
+                        owners[engine_id] = None;
+                    }
+                    self.sessions.release(&session_id);
+                }
                 return Err(Status::invalid_argument(format!(
                     "prompt too long: {} tokens (limit {})",
                     trunc_ids.len(),
@@ -289,6 +363,12 @@ impl Fermi for FermiService {
         }
         if input_ids.len() >= self.max_position_embeddings {
             self.sessions.end(&session_id);
+            if ephemeral_session {
+                if let Ok(mut owners) = self.engine_owner.lock() {
+                    owners[engine_id] = None;
+                }
+                self.sessions.release(&session_id);
+            }
             return Err(Status::invalid_argument(format!(
                 "prompt too long: {} tokens (limit {})",
                 input_ids.len(),
@@ -312,6 +392,7 @@ impl Fermi for FermiService {
         let mut loop_triggered = false;
         let mut timeout_triggered = false;
         let timeout_ms = self.timeout_ms;
+        let keep_session = !ephemeral_session;
 
         tokio::task::spawn_blocking(move || {
             struct SessionGuard {
@@ -359,9 +440,7 @@ impl Fermi for FermiService {
                         loop_triggered = true;
                         return Ok(false);
                     }
-                    let token_text = tokenizer
-                        .decode(&[token_id], true)
-                        .map_err(E::msg)?;
+                    let token_text = tokenizer.decode(&[token_id], true).map_err(E::msg)?;
                     assistant_buf.push_str(&token_text);
                     let resp = GenerateResponse {
                         token: token_text,
@@ -376,10 +455,7 @@ impl Fermi for FermiService {
 
             if timeout_triggered || loop_triggered {
                 engine.clear_kv_cache();
-                if let Ok(mut owners) = engine_owner.lock() {
-                    owners[engine_id] = None;
-                }
-                sessions.release(&session_id_clone);
+                release_session_binding(&engine_owner, &sessions, &session_id_clone, engine_id);
             }
 
             if timeout_triggered {
@@ -387,6 +463,8 @@ impl Fermi for FermiService {
             } else if loop_triggered {
                 let _ = tx.blocking_send(Err(Status::aborted("repetitive output detected")));
             } else if let Err(err) = &result {
+                engine.clear_kv_cache();
+                release_session_binding(&engine_owner, &sessions, &session_id_clone, engine_id);
                 let _ = tx.blocking_send(Err(Status::internal(err.to_string())));
             } else {
                 if let Ok(generated) = &result {
@@ -394,12 +472,14 @@ impl Fermi for FermiService {
                     if !generated.is_empty() {
                         cache_len += generated.len() - 1;
                         if let Some(&last_token) = generated.last() {
-                            if engine.append_tokens(&[last_token], cache_len, &device).is_ok() {
+                            if engine
+                                .append_tokens(&[last_token], cache_len, &device)
+                                .is_ok()
+                            {
                                 cache_len += 1;
                                 if let Some(im_end) = im_end_id {
                                     if last_token != im_end {
-                                        let _ =
-                                            engine.append_tokens(&[im_end], cache_len, &device);
+                                        let _ = engine.append_tokens(&[im_end], cache_len, &device);
                                         cache_len += 1;
                                     }
                                 }
@@ -407,19 +487,29 @@ impl Fermi for FermiService {
                         }
                     }
                     kept_history.push((prompt_user, assistant_buf));
-                    sessions.update_state(&session_id_clone, |state| {
-                        state.history = kept_history;
-                        state.has_context = true;
-                        state.current_pos = cache_len;
-                        state.engine_id = Some(engine_id);
-                        state.system_prompt = system_prompt_used.clone();
-                    });
+                    if keep_session {
+                        sessions.update_state(&session_id_clone, |state| {
+                            state.history = kept_history;
+                            state.has_context = true;
+                            state.current_pos = cache_len;
+                            state.engine_id = Some(engine_id);
+                            state.system_prompt = system_prompt_used.clone();
+                        });
+                    }
                 }
-                sessions.touch(&session_id_clone);
+                if keep_session {
+                    sessions.touch(&session_id_clone);
+                } else {
+                    release_session_binding(&engine_owner, &sessions, &session_id_clone, engine_id);
+                }
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as Self::GenerateStream))
+        inflight_guard.enabled = false;
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::GenerateStream
+        ))
     }
 }
 
@@ -494,6 +584,10 @@ async fn main() -> AnyResult<()> {
 
     let addr = "0.0.0.0:50051".parse()?;
     let timeout_ms = env_u64("FERMI_TIMEOUT_MS").unwrap_or(60_000);
+    let session_ttl_ms = env_u64("FERMI_SESSION_TTL_MS").filter(|v| *v > 0);
+    let session_max = env_u64("FERMI_SESSION_MAX")
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0);
     let default_system_prompt = env::var("FERMI_DEFAULT_SYSTEM_PROMPT").ok();
     let disable_think = env_flag("FERMI_DISABLE_THINK");
     let service = FermiService::new(
@@ -502,6 +596,8 @@ async fn main() -> AnyResult<()> {
         tokenizer,
         max_position_embeddings,
         timeout_ms,
+        session_ttl_ms,
+        session_max,
         default_system_prompt,
         disable_think,
     );

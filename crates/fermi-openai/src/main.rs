@@ -1,28 +1,30 @@
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result as AnyResult;
 use axum::{
-    Json,
-    Router,
+    Json, Router,
     extract::State,
     http::StatusCode,
-    response::{IntoResponse, Response, sse::{Event, Sse}},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
 use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Bearer;
 use candle_core::Device;
-use fermi_io::{load_tokenizer};
+use fermi_io::load_tokenizer;
 use fermi_runtime::{GenerationConfig, InferenceEngine, ModelBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{mpsc, Semaphore};
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokenizers::Tokenizer;
+use tokio::sync::{Semaphore, mpsc};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -146,11 +148,22 @@ struct ModelInfo {
     owned_by: String,
 }
 
+#[derive(Serialize)]
+struct OpenAiErrorResponse {
+    error: OpenAiError,
+}
+
+#[derive(Serialize)]
+struct OpenAiError {
+    message: String,
+    r#type: String,
+    param: Option<String>,
+    code: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> AnyResult<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let device = device_setup()?;
     info!("openai server device: {:?}", device);
@@ -162,7 +175,7 @@ async fn main() -> AnyResult<()> {
     let disable_think = env_flag("FERMI_DISABLE_THINK");
 
     info!("model: {}", model_id);
-    
+
     // Initialize ModelBuilder
     let builder = ModelBuilder::new(&model_id, !offline)?;
 
@@ -224,6 +237,18 @@ async fn chat_completions(
     if auth.is_none() {
         warn!("missing Authorization header");
     }
+    if req.messages.is_empty() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "messages must not be empty",
+            "invalid_request_error",
+        );
+    }
+
+    let model_id = match resolve_model(req.model.as_deref(), &state.model_id) {
+        Ok(model) => model,
+        Err(msg) => return openai_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+    };
 
     let stream = req.stream.unwrap_or(false);
     let max_tokens = req
@@ -244,8 +269,7 @@ async fn chat_completions(
     if state.disable_think {
         think_mode = ThinkingMode::Off;
     } else if matches!(think_mode, ThinkingMode::On | ThinkingMode::Auto) {
-        let model_id = req.model.as_deref().unwrap_or(&state.model_id);
-        if !supports_thinking(model_id) {
+        if !supports_thinking(&model_id) {
             think_mode = ThinkingMode::Off;
         } else if matches!(think_mode, ThinkingMode::Auto) {
             think_mode = ThinkingMode::On;
@@ -256,17 +280,20 @@ async fn chat_completions(
     let prompt_tokens = match state.tokenizer.encode(prompt.clone(), false) {
         Ok(tokens) => tokens.get_ids().len(),
         Err(err) => {
-            return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                err.to_string(),
+                "invalid_request_error",
+            );
         }
     };
 
     if prompt_tokens + max_tokens + 8 > state.max_position_embeddings {
         let msg = format!(
             "prompt too long: {} tokens (limit {})",
-            prompt_tokens,
-            state.max_position_embeddings
+            prompt_tokens, state.max_position_embeddings
         );
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+        return openai_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error");
     }
 
     let gen_cfg = GenerationConfig {
@@ -283,7 +310,13 @@ async fn chat_completions(
 
     let reply = match run_inference(state.clone(), prompt, gen_cfg).await {
         Ok(r) => r,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        Err(err) => {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+                "server_error",
+            );
+        }
     };
 
     let created = unix_ts();
@@ -291,7 +324,7 @@ async fn chat_completions(
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         object: "chat.completion".to_string(),
         created,
-        model: req.model.unwrap_or_else(|| state.model_id.clone()),
+        model: model_id,
         choices: vec![ChatChoice {
             index: 0,
             message: ChatMessageOut {
@@ -319,6 +352,11 @@ async fn responses(
         warn!("missing Authorization header");
     }
 
+    let model_id = match resolve_model(req.model.as_deref(), &state.model_id) {
+        Ok(model) => model,
+        Err(msg) => return openai_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+    };
+
     let stream = req.stream.unwrap_or(false);
     let max_tokens = req
         .max_output_tokens
@@ -330,21 +368,26 @@ async fn responses(
 
     let messages = match normalize_responses_input(&req.input, req.instructions.as_deref()) {
         Ok(m) => m,
-        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+        Err(err) => return openai_error(StatusCode::BAD_REQUEST, err, "invalid_request_error"),
     };
     let prompt = build_prompt(&messages, ThinkingMode::Off);
 
     let prompt_tokens = match state.tokenizer.encode(prompt.clone(), false) {
         Ok(tokens) => tokens.get_ids().len(),
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        Err(err) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                err.to_string(),
+                "invalid_request_error",
+            );
+        }
     };
     if prompt_tokens + max_tokens + 8 > state.max_position_embeddings {
         let msg = format!(
             "prompt too long: {} tokens (limit {})",
-            prompt_tokens,
-            state.max_position_embeddings
+            prompt_tokens, state.max_position_embeddings
         );
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+        return openai_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error");
     }
 
     let gen_cfg = GenerationConfig {
@@ -361,7 +404,13 @@ async fn responses(
 
     let reply = match run_inference(state.clone(), prompt, gen_cfg).await {
         Ok(r) => r,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        Err(err) => {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+                "server_error",
+            );
+        }
     };
 
     let created = unix_ts();
@@ -369,7 +418,7 @@ async fn responses(
         id: format!("resp-{}", Uuid::new_v4()),
         object: "response".to_string(),
         created,
-        model: req.model.unwrap_or_else(|| state.model_id.clone()),
+        model: model_id,
         output: vec![ResponseOutput {
             id: format!("msg-{}", Uuid::new_v4()),
             r#type: "message".to_string(),
@@ -395,7 +444,11 @@ struct InferenceResult {
     finish_reason: String,
 }
 
-async fn run_inference(state: Arc<AppState>, prompt: String, cfg: GenerationConfig) -> AnyResult<InferenceResult> {
+async fn run_inference(
+    state: Arc<AppState>,
+    prompt: String,
+    cfg: GenerationConfig,
+) -> AnyResult<InferenceResult> {
     let permit = state.semaphore.clone().acquire_owned().await?;
     let engine = next_engine(&state);
     let tokenizer = state.tokenizer.clone();
@@ -405,7 +458,9 @@ async fn run_inference(state: Arc<AppState>, prompt: String, cfg: GenerationConf
         let _permit = permit;
         let mut engine = engine.lock().expect("engine mutex poisoned");
         engine.clear_kv_cache();
-        let tokens = tokenizer.encode(prompt, false).map_err(anyhow::Error::msg)?;
+        let tokens = tokenizer
+            .encode(prompt, false)
+            .map_err(anyhow::Error::msg)?;
         let input_ids = tokens.get_ids().to_vec();
 
         let mut utf8 = Utf8Buffer::new();
@@ -420,18 +475,15 @@ async fn run_inference(state: Arc<AppState>, prompt: String, cfg: GenerationConf
             out.push_str(&tail);
         }
 
-        let finish_reason = if !generated.is_empty() {
-            "stop".to_string()
-        } else {
-            "length".to_string()
-        };
+        let finish_reason = finish_reason_for_generation(&generated, &cfg);
 
         Ok(InferenceResult {
             text: out,
             completion_tokens: generated.len(),
             finish_reason,
         })
-    }).await??;
+    })
+    .await??;
 
     Ok(result)
 }
@@ -439,7 +491,13 @@ async fn run_inference(state: Arc<AppState>, prompt: String, cfg: GenerationConf
 async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig) -> Response {
     let permit = match state.semaphore.clone().acquire_owned().await {
         Ok(p) => p,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        Err(err) => {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+                "server_error",
+            );
+        }
     };
     let engine = next_engine(&state);
     let tokenizer = state.tokenizer.clone();
@@ -467,7 +525,11 @@ async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig
         let tokens = match tokenizer.encode(prompt, false) {
             Ok(t) => t,
             Err(err) => {
-                let _ = tx.blocking_send(Ok(Event::default().data(err.to_string())));
+                let _ = tx.blocking_send(Ok(Event::default().data(openai_error_payload(
+                    err.to_string(),
+                    "invalid_request_error",
+                ))));
+                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
                 return;
             }
         };
@@ -501,9 +563,9 @@ async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig
             }
         }
 
-        let finish_reason = match result {
-            Ok(_) => "stop",
-            Err(_) => "error",
+        let finish_reason = match &result {
+            Ok(generated) => finish_reason_for_generation(generated, &cfg),
+            Err(_) => "error".to_string(),
         };
         let end_evt = json!({
             "id": id,
@@ -525,7 +587,13 @@ async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig
 async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationConfig) -> Response {
     let permit = match state.semaphore.clone().acquire_owned().await {
         Ok(p) => p,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        Err(err) => {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+                "server_error",
+            );
+        }
     };
     let engine = next_engine(&state);
     let tokenizer = state.tokenizer.clone();
@@ -553,7 +621,11 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
         let tokens = match tokenizer.encode(prompt, false) {
             Ok(t) => t,
             Err(err) => {
-                let _ = tx.blocking_send(Ok(Event::default().data(err.to_string())));
+                let _ = tx.blocking_send(Ok(Event::default().data(openai_error_payload(
+                    err.to_string(),
+                    "invalid_request_error",
+                ))));
+                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
                 return;
             }
         };
@@ -589,8 +661,15 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
             }
         }
 
-        let finish_type = match result {
-            Ok(_) => "response.completed",
+        let finish_type = match &result {
+            Ok(generated) => {
+                let reason = finish_reason_for_generation(generated, &cfg);
+                if reason == "length" {
+                    "response.incomplete"
+                } else {
+                    "response.completed"
+                }
+            }
             Err(_) => "response.failed",
         };
         let end_evt = json!({
@@ -680,7 +759,10 @@ fn normalize_responses_input(
         serde_json::Value::Array(arr) => {
             for item in arr {
                 if let Some(role) = item.get("role").and_then(|v| v.as_str()) {
-                    let content = item.get("content").cloned().unwrap_or(serde_json::Value::Null);
+                    let content = item
+                        .get("content")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     out.push(ChatMessage {
                         role: role.to_string(),
                         content,
@@ -784,6 +866,58 @@ fn supports_thinking(model_id: &str) -> bool {
     id.contains("qwen") || id.contains("deepseek") || id.contains("r1") || id.contains("qwq")
 }
 
+fn finish_reason_for_generation(generated: &[u32], cfg: &GenerationConfig) -> String {
+    if generated.is_empty() {
+        return "length".to_string();
+    }
+    if let Some(last) = generated.last() {
+        if cfg.stop_tokens.contains(last) {
+            return "stop".to_string();
+        }
+    }
+    if generated.len() >= cfg.max_new_tokens {
+        return "length".to_string();
+    }
+    "stop".to_string()
+}
+
+fn openai_error(status: StatusCode, message: impl Into<String>, error_type: &str) -> Response {
+    let body = OpenAiErrorResponse {
+        error: OpenAiError {
+            message: message.into(),
+            r#type: error_type.to_string(),
+            param: None,
+            code: None,
+        },
+    };
+    (status, Json(body)).into_response()
+}
+
+fn openai_error_payload(message: impl Into<String>, error_type: &str) -> String {
+    serde_json::to_string(&OpenAiErrorResponse {
+        error: OpenAiError {
+            message: message.into(),
+            r#type: error_type.to_string(),
+            param: None,
+            code: None,
+        },
+    })
+    .unwrap_or_else(|_| {
+        "{\"error\":{\"message\":\"internal error\",\"type\":\"server_error\"}}".to_string()
+    })
+}
+
+fn resolve_model(requested: Option<&str>, loaded: &str) -> Result<String, String> {
+    match requested {
+        Some(model) if model != loaded => Err(format!(
+            "model '{}' not available, loaded model is '{}'",
+            model, loaded
+        )),
+        Some(model) => Ok(model.to_string()),
+        None => Ok(loaded.to_string()),
+    }
+}
+
 fn env_u64(key: &str) -> Option<u64> {
     std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
 }
@@ -799,9 +933,15 @@ impl Utf8Buffer {
         }
     }
 
-    fn push_and_decode(&mut self, token_id: u32, tokenizer: &Tokenizer) -> AnyResult<Option<String>> {
+    fn push_and_decode(
+        &mut self,
+        token_id: u32,
+        tokenizer: &Tokenizer,
+    ) -> AnyResult<Option<String>> {
         self.pending_ids.push(token_id);
-        let text = tokenizer.decode(&self.pending_ids, true).map_err(anyhow::Error::msg)?;
+        let text = tokenizer
+            .decode(&self.pending_ids, true)
+            .map_err(anyhow::Error::msg)?;
         if text.contains('\u{FFFD}') {
             Ok(None)
         } else {
@@ -814,8 +954,54 @@ impl Utf8Buffer {
         if self.pending_ids.is_empty() {
             return Ok(None);
         }
-        let text = tokenizer.decode(&self.pending_ids, true).map_err(anyhow::Error::msg)?;
+        let text = tokenizer
+            .decode(&self.pending_ids, true)
+            .map_err(anyhow::Error::msg)?;
         self.pending_ids.clear();
         Ok(Some(text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cfg(max_new_tokens: usize, stop_tokens: Vec<u32>) -> GenerationConfig {
+        GenerationConfig {
+            max_new_tokens,
+            repeat_penalty: 1.0,
+            stop_tokens,
+            temperature: 1.0,
+            top_p: 1.0,
+        }
+    }
+
+    #[test]
+    fn finish_reason_is_stop_on_stop_token() {
+        let cfg = test_cfg(16, vec![2]);
+        assert_eq!(finish_reason_for_generation(&[7, 2], &cfg), "stop");
+    }
+
+    #[test]
+    fn finish_reason_is_length_on_token_limit() {
+        let cfg = test_cfg(3, vec![2]);
+        assert_eq!(finish_reason_for_generation(&[7, 8, 9], &cfg), "length");
+    }
+
+    #[test]
+    fn finish_reason_is_length_on_empty_output() {
+        let cfg = test_cfg(3, vec![2]);
+        assert_eq!(finish_reason_for_generation(&[], &cfg), "length");
+    }
+
+    #[test]
+    fn openai_error_payload_is_json_shape() {
+        let payload = openai_error_payload("bad request", "invalid_request_error");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid json");
+        assert_eq!(
+            value["error"]["type"].as_str(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(value["error"]["message"].as_str(), Some("bad request"));
     }
 }

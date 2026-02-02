@@ -1,8 +1,8 @@
+use crate::session::{SessionId, SessionStore};
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use fermi_models::qwen3::{Config, Qwen3Model};
-use crate::session::{SessionId, SessionStore};
 
 pub struct GenerationConfig {
     pub max_new_tokens: usize,
@@ -40,12 +40,7 @@ pub trait InferenceEngine: Send + Sync {
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
     ) -> Result<Vec<u32>>;
 
-    fn append_tokens(
-        &mut self,
-        tokens: &[u32],
-        offset: usize,
-        device: &Device,
-    ) -> Result<()>;
+    fn append_tokens(&mut self, tokens: &[u32], offset: usize, device: &Device) -> Result<()>;
 }
 
 // =========================================================================
@@ -81,12 +76,7 @@ impl InferenceEngine for Qwen3Engine {
         self.generate_stream_with_offset_internal(input_ids, offset, device, cfg, on_token)
     }
 
-    fn append_tokens(
-        &mut self,
-        tokens: &[u32],
-        offset: usize,
-        device: &Device,
-    ) -> Result<()> {
+    fn append_tokens(&mut self, tokens: &[u32], offset: usize, device: &Device) -> Result<()> {
         if tokens.is_empty() {
             return Ok(());
         }
@@ -179,7 +169,8 @@ impl Qwen3Engine {
             return Ok(generated_ids);
         }
 
-        for _ in 0..cfg.max_new_tokens {
+        // Prefill already produced the first token, so decode at most N-1 more.
+        for _ in 1..cfg.max_new_tokens {
             next_token_id =
                 self.decode_step(next_token_id, current_pos, &generated_ids, device, cfg)?;
             generated_ids.push(next_token_id);
@@ -224,7 +215,8 @@ impl Qwen3Engine {
             return Ok(generated_ids);
         }
 
-        for _ in 0..cfg.max_new_tokens {
+        // Prefill already produced the first token, so decode at most N-1 more.
+        for _ in 1..cfg.max_new_tokens {
             next_token_id =
                 self.decode_step(next_token_id, current_pos, &generated_ids, device, cfg)?;
             generated_ids.push(next_token_id);
@@ -241,8 +233,6 @@ impl Qwen3Engine {
 
         Ok(generated_ids)
     }
-
-
 
     pub fn generate_stream_with_offset<F>(
         &mut self,
@@ -271,7 +261,8 @@ impl Qwen3Engine {
             return Ok(generated_ids);
         }
 
-        for _ in 0..cfg.max_new_tokens {
+        // Prefill already produced the first token, so decode at most N-1 more.
+        for _ in 1..cfg.max_new_tokens {
             next_token_id =
                 self.decode_step(next_token_id, current_pos, &generated_ids, device, cfg)?;
             generated_ids.push(next_token_id);
@@ -289,12 +280,7 @@ impl Qwen3Engine {
         Ok(generated_ids)
     }
 
-    pub fn append_tokens(
-        &mut self,
-        tokens: &[u32],
-        offset: usize,
-        device: &Device,
-    ) -> Result<()> {
+    pub fn append_tokens(&mut self, tokens: &[u32], offset: usize, device: &Device) -> Result<()> {
         if tokens.is_empty() {
             return Ok(());
         }

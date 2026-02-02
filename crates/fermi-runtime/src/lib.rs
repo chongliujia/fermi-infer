@@ -1,7 +1,7 @@
 pub mod engine;
-pub mod session;
 pub mod loader;
+pub mod session;
 
-pub use engine::{GenerationConfig, PrefillOutput, Qwen3Engine, InferenceEngine};
-pub use session::{InMemorySessionStore, SessionId, SessionState, SessionStore};
+pub use engine::{GenerationConfig, InferenceEngine, PrefillOutput, Qwen3Engine};
 pub use loader::ModelBuilder;
+pub use session::{InMemorySessionStore, SessionGcEvent, SessionId, SessionState, SessionStore};

@@ -1,11 +1,11 @@
 use anyhow::{Error as E, Result};
-use candle_core::{Device};
-use fermi_io::{load_tokenizer};
+use candle_core::Device;
+use fermi_io::load_tokenizer;
 use fermi_runtime::{GenerationConfig, ModelBuilder};
-use tokenizers::Tokenizer;
 use std::env;
 use std::io::{self, Write};
 use std::time::Instant;
+use tokenizers::Tokenizer;
 
 fn main() -> Result<()> {
     let cli_cfg = parse_args()?;
@@ -21,15 +21,15 @@ fn main() -> Result<()> {
         .clone()
         .or_else(|| std::env::var("FERMI_MODEL").ok())
         .unwrap_or_else(|| "Qwen/Qwen3-1.7B".to_string());
-    
+
     println!("📥 准备模型文件...");
     println!("📦 模型: {}", model_repo_id);
-    
+
     let builder = ModelBuilder::new(&model_repo_id, !cli_cfg.offline)?;
 
     println!("✅ 权重下载/验证完成");
     println!("⚙️ 正在初始化推理引擎...");
-    
+
     let mut engine = builder.create_engine(&device)?;
     let tokenizer = load_tokenizer(builder.tokenizer_path())?;
     engine.clear_kv_cache();
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
         let expected_max = offset + input_ids.len() + gen_cfg.max_new_tokens + 8;
         if expected_max > max_ctx {
             let pairs = history_pairs(&history);
-            let (trunc_ids, kept_pairs) = 
+            let (trunc_ids, kept_pairs) =
                 build_truncated_prompt(&pairs, line, &tokenizer, max_ctx, gen_cfg.max_new_tokens)?;
             if trunc_ids.len() >= max_ctx {
                 println!("⚠️ 输入过长，已超过最大上下文 {} tokens", max_ctx);
@@ -120,7 +120,7 @@ fn main() -> Result<()> {
         let mut assistant_buf = String::new();
         let mut utf8_buffer = Utf8Buffer::new();
         let mut think_filter = ThinkFilter::new();
-        
+
         // Loop detection state
         let mut recent_tokens: Vec<u32> = Vec::with_capacity(12);
         let mut loop_triggered = false;
@@ -310,10 +310,16 @@ fn parse_args() -> Result<CliConfig> {
 }
 
 fn print_usage() {
-    println!("Usage: fermi-infer [--model ID|PATH] [--offline] [--timeout-ms MS] [--max-new-tokens N] [--repeat-penalty P] [--temperature T] [--top-p P]");
-    println!("  --model           HuggingFace repo id or local model dir (default: Qwen/Qwen3-1.7B)");
+    println!(
+        "Usage: fermi-infer [--model ID|PATH] [--offline] [--timeout-ms MS] [--max-new-tokens N] [--repeat-penalty P] [--temperature T] [--top-p P]"
+    );
+    println!(
+        "  --model           HuggingFace repo id or local model dir (default: Qwen/Qwen3-1.7B)"
+    );
     println!("  --offline         Disable network access; require local model files");
-    println!("  --timeout-ms      Per-request timeout in milliseconds (default: 60000; 0 disables)");
+    println!(
+        "  --timeout-ms      Per-request timeout in milliseconds (default: 60000; 0 disables)"
+    );
     println!("  --max-new-tokens  Maximum number of generated tokens (default: 1024)");
     println!("  --repeat-penalty  Repetition penalty (default: 1.1)");
     println!("  --temperature     Sampling temperature (default: 0.8)");
@@ -420,11 +426,7 @@ impl Utf8Buffer {
         }
     }
 
-    fn push_and_decode(
-        &mut self,
-        token_id: u32,
-        tokenizer: &Tokenizer,
-    ) -> Result<Option<String>> {
+    fn push_and_decode(&mut self, token_id: u32, tokenizer: &Tokenizer) -> Result<Option<String>> {
         self.pending_ids.push(token_id);
         let text = tokenizer.decode(&self.pending_ids, true).map_err(E::msg)?;
         if text.contains('\u{FFFD}') {

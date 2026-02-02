@@ -1,5 +1,5 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{linear_no_bias, Linear, VarBuilder};
+use candle_nn::{Linear, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone)]
@@ -126,7 +126,9 @@ impl Attention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        let q = q.reshape((b, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let q = q
+            .reshape((b, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
         let k = k
             .reshape((b, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
@@ -186,7 +188,9 @@ impl Attention {
             Ok(x.clone())
         } else {
             let (b, n_kv_head, seq_len, head_dim) = x.dims4()?;
-            let x = x.unsqueeze(2)?.expand((b, n_kv_head, n_rep, seq_len, head_dim))?;
+            let x = x
+                .unsqueeze(2)?
+                .expand((b, n_kv_head, n_rep, seq_len, head_dim))?;
             x.reshape((b, n_kv_head * n_rep, seq_len, head_dim))
         }
     }
@@ -379,7 +383,8 @@ struct Block {
 
 impl Block {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let rms_1 = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let rms_1 =
+            candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let attn = Attention::new(cfg, vb.pp("self_attn"))?;
         let rms_2 = candle_nn::rms_norm(
             cfg.hidden_size,

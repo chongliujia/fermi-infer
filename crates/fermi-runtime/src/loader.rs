@@ -1,9 +1,9 @@
-use std::path::PathBuf;
 use anyhow::Result;
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
-use fermi_io::{download_qwen3_files, load_qwen3_config, Qwen3Files};
+use fermi_io::{Qwen3Files, download_qwen3_files, load_qwen3_config};
 use fermi_models::qwen3::Config;
+use std::path::PathBuf;
 
 use crate::engine::{InferenceEngine, Qwen3Engine};
 
@@ -21,13 +21,18 @@ impl ModelBuilder {
     }
 
     pub fn create_engine(&self, device: &Device) -> Result<Box<dyn InferenceEngine>> {
-        let dtype = if device.is_metal() { DType::F16 } else { DType::F32 };
-        
+        let dtype = if device.is_metal() {
+            DType::F16
+        } else {
+            DType::F32
+        };
+
         // Load weights (mmap)
-        // Note: VarBuilder::from_mmaped_safetensors requires 'static lifetime for the path usually, 
+        // Note: VarBuilder::from_mmaped_safetensors requires 'static lifetime for the path usually,
         // or we just pass the paths. internal implementation handles it.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&self.files.weights, dtype, device)? };
-        
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&self.files.weights, dtype, device)? };
+
         let engine = Qwen3Engine::new(&self.config, vb)?;
         Ok(Box::new(engine))
     }
