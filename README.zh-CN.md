@@ -93,8 +93,10 @@ cargo run -p fermi-infer --release --features cuda
 - `/exit` 退出
 
 CLI 参数：
-- `--max-new-tokens N` 生成上限（默认 1024）
-- `--repeat-penalty P` 重复惩罚（默认 1.0）
+- `--config PATH` 指定配置文件（默认自动发现 `./fermi.toml`）
+- `--offline` / `--online` 强制离线/在线模型加载
+- `--max-new-tokens N` 生成上限
+- `--repeat-penalty P` 重复惩罚
 
 ## gRPC API
 
@@ -106,17 +108,66 @@ crates/fermi-grpc/proto/fermi.proto
 
 ## 会话（简化版）
 
-当前是内存型 session，暂未实现 TTL/LRU。
+当前是内存型 session，已支持 TTL / LRU 回收。
 
 ## 环境变量
+
+推荐优先使用 `fermi.toml` 统一配置，再用环境变量做覆盖。
+
+自动发现顺序：
+- CLI `--config PATH`（仅 CLI）
+- `FERMI_CONFIG=/path/to/fermi.toml`
+- 当前目录 `./fermi.toml`
+
+示例 `fermi.toml`：
+
+```toml
+[model]
+id = "Qwen/Qwen3-1.7B"
+offline = false
+
+[generation]
+default_max_new_tokens = 256
+max_new_tokens_cap = 9056
+temperature = 0.2
+top_p = 1.0
+repeat_penalty = 1.1
+
+[openai]
+addr = "0.0.0.0:8000"
+engine_pool = 1
+default_thinking = "off"
+supports_thinking = true
+disable_think = false
+
+[grpc]
+addr = "0.0.0.0:50051"
+engine_pool = 1
+timeout_ms = 60000
+session_ttl_ms = 0
+session_max = 0
+default_system_prompt = ""
+disable_think = false
+```
+
+可直接复制 `fermi.toml.example` 作为起点。
 
 - `FERMI_MODEL` 模型 ID（默认：`Qwen/Qwen3-1.7B`）
 - `FERMI_OFFLINE=1` / `HF_HUB_OFFLINE=1` 关闭在线下载
 - `FERMI_ENGINE_POOL` HTTP 服务器实例数量
 - `FERMI_OPENAI_ADDR` HTTP 监听地址
+- `FERMI_GRPC_ADDR` gRPC 监听地址
 - `FERMI_DEFAULT_THINKING` / `FERMI_SUPPORTS_THINKING` / `FERMI_DISABLE_THINK`
 - `FERMI_SESSION_TTL_MS` gRPC 会话空闲 TTL（毫秒，未设置或 `0` 表示关闭）
 - `FERMI_SESSION_MAX` gRPC 内存会话上限（超过后按 LRU 回收）
+- `FERMI_DEFAULT_MAX_NEW_TOKENS` 生成默认上限（所有入口统一）
+- `FERMI_MAX_NEW_TOKENS_CAP` 生成硬上限
+- `FERMI_DEFAULT_TEMPERATURE` 默认温度（范围：`0.0` - `2.0`）
+- `FERMI_DEFAULT_TOP_P` 默认 top-p（范围：`(0.0, 1.0]`）
+- `FERMI_DEFAULT_REPEAT_PENALTY` 默认重复惩罚（范围：`1.0` - `2.0`）
+
+参数优先级（统一）：
+- 请求/CLI 参数 > 环境变量 > `fermi.toml` > 内置默认值
 
 ## API 兼容性说明
 

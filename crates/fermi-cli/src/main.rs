@@ -1,7 +1,10 @@
 use anyhow::{Error as E, Result};
 use candle_core::Device;
 use fermi_io::load_tokenizer;
-use fermi_runtime::{GenerationConfig, ModelBuilder};
+use fermi_runtime::{
+    GenerationConfig, ModelBuilder, load_config, resolve_sampling_params,
+    sampling_defaults_from_sources,
+};
 use std::env;
 use std::io::{self, Write};
 use std::time::Instant;
@@ -9,6 +12,11 @@ use tokenizers::Tokenizer;
 
 fn main() -> Result<()> {
     let cli_cfg = parse_args()?;
+    let loaded_cfg = load_config(cli_cfg.config.as_deref())?;
+    if let Some(path) = &loaded_cfg.path {
+        println!("🧩 配置文件: {}", path.display());
+    }
+    let app_cfg = loaded_cfg.config;
     // 1. 基础环境设置
     let device = device_setup()?;
     println!("🚀 运行设备: {:?}", device);
@@ -20,12 +28,28 @@ fn main() -> Result<()> {
         .model
         .clone()
         .or_else(|| std::env::var("FERMI_MODEL").ok())
+        .or_else(|| app_cfg.model.id.clone())
         .unwrap_or_else(|| "Qwen/Qwen3-1.7B".to_string());
+    let offline = cli_cfg
+        .offline
+        .or_else(|| env_flag_opt("FERMI_OFFLINE"))
+        .or_else(|| env_flag_opt("HF_HUB_OFFLINE"))
+        .or(app_cfg.model.offline)
+        .unwrap_or(false);
 
     println!("📥 准备模型文件...");
     println!("📦 模型: {}", model_repo_id);
 
-    let builder = ModelBuilder::new(&model_repo_id, !cli_cfg.offline)?;
+    let builder = ModelBuilder::new(&model_repo_id, !offline)?;
+    let sampling_defaults =
+        sampling_defaults_from_sources(app_cfg.generation.to_sampling_overrides())?;
+    let sampling = resolve_sampling_params(
+        cli_cfg.max_new_tokens,
+        cli_cfg.temperature,
+        cli_cfg.top_p,
+        cli_cfg.repeat_penalty,
+        &sampling_defaults,
+    )?;
 
     println!("✅ 权重下载/验证完成");
     println!("⚙️ 正在初始化推理引擎...");
@@ -49,11 +73,11 @@ fn main() -> Result<()> {
     }
 
     let gen_cfg = GenerationConfig {
-        max_new_tokens: cli_cfg.max_new_tokens,
-        repeat_penalty: cli_cfg.repeat_penalty,
+        max_new_tokens: sampling.max_new_tokens,
+        repeat_penalty: sampling.repeat_penalty,
         stop_tokens,
-        temperature: cli_cfg.temperature,
-        top_p: cli_cfg.top_p,
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
     };
     let max_ctx = builder.max_position_embeddings();
     let timeout_ms = cli_cfg.timeout_ms;
@@ -222,22 +246,24 @@ fn device_setup() -> Result<Device> {
 }
 
 struct CliConfig {
-    max_new_tokens: usize,
-    repeat_penalty: f32,
-    temperature: f32,
-    top_p: f32,
+    max_new_tokens: Option<usize>,
+    repeat_penalty: Option<f32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
     model: Option<String>,
-    offline: bool,
+    offline: Option<bool>,
+    config: Option<String>,
     timeout_ms: u64,
 }
 
 fn parse_args() -> Result<CliConfig> {
-    let mut max_new_tokens = 1024usize;
-    let mut repeat_penalty = 1.1f32;
-    let mut temperature = 0.8f32;
-    let mut top_p = 0.95f32;
+    let mut max_new_tokens = None;
+    let mut repeat_penalty = None;
+    let mut temperature = None;
+    let mut top_p = None;
     let mut model: Option<String> = None;
-    let mut offline = false;
+    let mut offline: Option<bool> = None;
+    let mut config: Option<String> = None;
     let mut timeout_ms: u64 = 60_000;
 
     let mut args = env::args().skip(1);
@@ -251,7 +277,17 @@ fn parse_args() -> Result<CliConfig> {
                 }
             }
             "--offline" => {
-                offline = true;
+                offline = Some(true);
+            }
+            "--online" => {
+                offline = Some(false);
+            }
+            "--config" => {
+                if let Some(v) = args.next() {
+                    config = Some(v);
+                } else {
+                    return Err(E::msg("--config requires a value"));
+                }
             }
             "--timeout-ms" => {
                 if let Some(v) = args.next() {
@@ -262,28 +298,28 @@ fn parse_args() -> Result<CliConfig> {
             }
             "--max-new-tokens" => {
                 if let Some(v) = args.next() {
-                    max_new_tokens = v.parse::<usize>().map_err(E::msg)?;
+                    max_new_tokens = Some(v.parse::<usize>().map_err(E::msg)?);
                 } else {
                     return Err(E::msg("--max-new-tokens requires a value"));
                 }
             }
             "--repeat-penalty" => {
                 if let Some(v) = args.next() {
-                    repeat_penalty = v.parse::<f32>().map_err(E::msg)?;
+                    repeat_penalty = Some(v.parse::<f32>().map_err(E::msg)?);
                 } else {
                     return Err(E::msg("--repeat-penalty requires a value"));
                 }
             }
             "--temperature" => {
                 if let Some(v) = args.next() {
-                    temperature = v.parse::<f32>().map_err(E::msg)?;
+                    temperature = Some(v.parse::<f32>().map_err(E::msg)?);
                 } else {
                     return Err(E::msg("--temperature requires a value"));
                 }
             }
             "--top-p" => {
                 if let Some(v) = args.next() {
-                    top_p = v.parse::<f32>().map_err(E::msg)?;
+                    top_p = Some(v.parse::<f32>().map_err(E::msg)?);
                 } else {
                     return Err(E::msg("--top-p requires a value"));
                 }
@@ -305,25 +341,44 @@ fn parse_args() -> Result<CliConfig> {
         top_p,
         model,
         offline,
+        config,
         timeout_ms,
     })
 }
 
 fn print_usage() {
     println!(
-        "Usage: fermi-infer [--model ID|PATH] [--offline] [--timeout-ms MS] [--max-new-tokens N] [--repeat-penalty P] [--temperature T] [--top-p P]"
+        "Usage: fermi-infer [--config PATH] [--model ID|PATH] [--offline|--online] [--timeout-ms MS] [--max-new-tokens N] [--repeat-penalty P] [--temperature T] [--top-p P]"
     );
+    println!("  --config          Config file path (default auto-discover: ./fermi.toml)");
     println!(
         "  --model           HuggingFace repo id or local model dir (default: Qwen/Qwen3-1.7B)"
     );
     println!("  --offline         Disable network access; require local model files");
+    println!("  --online          Force enable network access");
     println!(
         "  --timeout-ms      Per-request timeout in milliseconds (default: 60000; 0 disables)"
     );
-    println!("  --max-new-tokens  Maximum number of generated tokens (default: 1024)");
-    println!("  --repeat-penalty  Repetition penalty (default: 1.1)");
-    println!("  --temperature     Sampling temperature (default: 0.8)");
-    println!("  --top-p           Nucleus sampling p (default: 0.95)");
+    println!("  --max-new-tokens  Maximum number of generated tokens");
+    println!("  --repeat-penalty  Repetition penalty in [1.0, 2.0]");
+    println!("  --temperature     Sampling temperature in [0.0, 2.0]");
+    println!("  --top-p           Nucleus sampling p in (0.0, 1.0]");
+}
+
+fn env_flag_opt(key: &str) -> Option<bool> {
+    match env::var(key) {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            if matches!(s.as_str(), "1" | "true" | "yes" | "on") {
+                Some(true)
+            } else if matches!(s.as_str(), "0" | "false" | "no" | "off") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
 }
 
 fn loop_detected(recent: &[u32]) -> bool {

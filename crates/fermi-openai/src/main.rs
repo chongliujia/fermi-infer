@@ -19,7 +19,10 @@ use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Bearer;
 use candle_core::Device;
 use fermi_io::load_tokenizer;
-use fermi_runtime::{GenerationConfig, InferenceEngine, ModelBuilder};
+use fermi_runtime::{
+    GenerationConfig, InferenceEngine, ModelBuilder, SamplingDefaults, load_config,
+    resolve_sampling_params, sampling_defaults_from_sources,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokenizers::Tokenizer;
@@ -29,8 +32,6 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const DEFAULT_MODEL: &str = "Qwen/Qwen3-1.7B";
-const DEFAULT_MAX_TOKENS: usize = 256;
-const MAX_NEW_TOKENS: usize = 9056;
 
 struct AppState {
     engines: Vec<Arc<Mutex<Box<dyn InferenceEngine>>>>,
@@ -42,6 +43,9 @@ struct AppState {
     model_id: String,
     max_position_embeddings: usize,
     disable_think: bool,
+    default_thinking: ThinkingMode,
+    supports_thinking_override: Option<bool>,
+    sampling_defaults: SamplingDefaults,
 }
 
 #[derive(Deserialize)]
@@ -165,21 +169,56 @@ struct OpenAiError {
 async fn main() -> AnyResult<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
+    let loaded_cfg = load_config(None)?;
+    if let Some(path) = &loaded_cfg.path {
+        info!("loaded config file: {}", path.display());
+    }
+    let app_cfg = loaded_cfg.config;
+
     let device = device_setup()?;
     info!("openai server device: {:?}", device);
 
     let model_id = std::env::var("FERMI_MODEL")
         .ok()
+        .or_else(|| app_cfg.model.id.clone())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let offline = env_flag("FERMI_OFFLINE") || env_flag("HF_HUB_OFFLINE");
-    let disable_think = env_flag("FERMI_DISABLE_THINK");
+    let offline = env_flag_opt("FERMI_OFFLINE")
+        .or_else(|| env_flag_opt("HF_HUB_OFFLINE"))
+        .or(app_cfg.model.offline)
+        .unwrap_or(false);
+    let disable_think = env_flag_opt("FERMI_DISABLE_THINK")
+        .or(app_cfg.openai.disable_think)
+        .unwrap_or(false);
+    let default_thinking = std::env::var("FERMI_DEFAULT_THINKING")
+        .ok()
+        .map(|v| parse_thinking_mode(&v))
+        .or_else(|| {
+            app_cfg
+                .openai
+                .default_thinking
+                .as_deref()
+                .map(parse_thinking_mode)
+        })
+        .unwrap_or(ThinkingMode::Off);
+    let supports_thinking_override =
+        env_flag_opt("FERMI_SUPPORTS_THINKING").or(app_cfg.openai.supports_thinking);
 
     info!("model: {}", model_id);
 
     // Initialize ModelBuilder
     let builder = ModelBuilder::new(&model_id, !offline)?;
+    let sampling_defaults =
+        sampling_defaults_from_sources(app_cfg.generation.to_sampling_overrides())?;
 
-    let pool_size = env_u64("FERMI_ENGINE_POOL").unwrap_or(1).max(1) as usize;
+    let pool_size = env_u64("FERMI_ENGINE_POOL")
+        .or_else(|| {
+            app_cfg
+                .openai
+                .engine_pool
+                .and_then(|v| u64::try_from(v).ok())
+        })
+        .unwrap_or(1)
+        .max(1) as usize;
     let mut engines: Vec<Arc<Mutex<Box<dyn InferenceEngine>>>> = Vec::with_capacity(pool_size);
     for _ in 0..pool_size {
         let mut engine = builder.create_engine(&device)?;
@@ -201,9 +240,15 @@ async fn main() -> AnyResult<()> {
         model_id: model_id.clone(),
         max_position_embeddings: builder.max_position_embeddings(),
         disable_think,
+        default_thinking,
+        supports_thinking_override,
+        sampling_defaults,
     };
 
-    let addr = std::env::var("FERMI_OPENAI_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
+    let addr = std::env::var("FERMI_OPENAI_ADDR")
+        .ok()
+        .or(app_cfg.openai.addr)
+        .unwrap_or_else(|| "0.0.0.0:8000".to_string());
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
@@ -251,17 +296,30 @@ async fn chat_completions(
     };
 
     let stream = req.stream.unwrap_or(false);
-    let max_tokens = req
+    let requested_max_new_tokens = req
         .max_completion_tokens
         .or(req.max_tokens)
         .map(|v| v as usize)
-        .unwrap_or(DEFAULT_MAX_TOKENS)
-        .min(MAX_NEW_TOKENS);
-    let temperature = req.temperature.unwrap_or(0.8);
-    let top_p = req.top_p.unwrap_or(0.95);
+        .filter(|v| *v > 0);
+    let sampling = match resolve_sampling_params(
+        requested_max_new_tokens,
+        req.temperature,
+        req.top_p,
+        None,
+        &state.sampling_defaults,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                err.to_string(),
+                "invalid_request_error",
+            );
+        }
+    };
 
     let requested = req.thinking.as_deref();
-    let default_mode = env_default_thinking();
+    let default_mode = state.default_thinking;
     let mut think_mode = match requested {
         Some(v) => parse_thinking_mode(v),
         None => default_mode,
@@ -269,7 +327,7 @@ async fn chat_completions(
     if state.disable_think {
         think_mode = ThinkingMode::Off;
     } else if matches!(think_mode, ThinkingMode::On | ThinkingMode::Auto) {
-        if !supports_thinking(&model_id) {
+        if !supports_thinking(&model_id, state.supports_thinking_override) {
             think_mode = ThinkingMode::Off;
         } else if matches!(think_mode, ThinkingMode::Auto) {
             think_mode = ThinkingMode::On;
@@ -288,7 +346,7 @@ async fn chat_completions(
         }
     };
 
-    if prompt_tokens + max_tokens + 8 > state.max_position_embeddings {
+    if prompt_tokens + sampling.max_new_tokens + 8 > state.max_position_embeddings {
         let msg = format!(
             "prompt too long: {} tokens (limit {})",
             prompt_tokens, state.max_position_embeddings
@@ -297,11 +355,11 @@ async fn chat_completions(
     }
 
     let gen_cfg = GenerationConfig {
-        max_new_tokens: max_tokens,
-        repeat_penalty: 1.1,
+        max_new_tokens: sampling.max_new_tokens,
+        repeat_penalty: sampling.repeat_penalty,
         stop_tokens: state.stop_tokens.clone(),
-        temperature,
-        top_p,
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
     };
 
     if stream {
@@ -358,13 +416,23 @@ async fn responses(
     };
 
     let stream = req.stream.unwrap_or(false);
-    let max_tokens = req
-        .max_output_tokens
-        .map(|v| v as usize)
-        .unwrap_or(DEFAULT_MAX_TOKENS)
-        .min(MAX_NEW_TOKENS);
-    let temperature = req.temperature.unwrap_or(0.8);
-    let top_p = req.top_p.unwrap_or(0.95);
+    let requested_max_new_tokens = req.max_output_tokens.map(|v| v as usize).filter(|v| *v > 0);
+    let sampling = match resolve_sampling_params(
+        requested_max_new_tokens,
+        req.temperature,
+        req.top_p,
+        None,
+        &state.sampling_defaults,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                err.to_string(),
+                "invalid_request_error",
+            );
+        }
+    };
 
     let messages = match normalize_responses_input(&req.input, req.instructions.as_deref()) {
         Ok(m) => m,
@@ -382,7 +450,7 @@ async fn responses(
             );
         }
     };
-    if prompt_tokens + max_tokens + 8 > state.max_position_embeddings {
+    if prompt_tokens + sampling.max_new_tokens + 8 > state.max_position_embeddings {
         let msg = format!(
             "prompt too long: {} tokens (limit {})",
             prompt_tokens, state.max_position_embeddings
@@ -391,11 +459,11 @@ async fn responses(
     }
 
     let gen_cfg = GenerationConfig {
-        max_new_tokens: max_tokens,
-        repeat_penalty: 1.1,
+        max_new_tokens: sampling.max_new_tokens,
+        repeat_penalty: sampling.repeat_penalty,
         stop_tokens: state.stop_tokens.clone(),
-        temperature,
-        top_p,
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
     };
 
     if stream {
@@ -835,10 +903,19 @@ fn unix_ts() -> u64 {
         .unwrap_or(0)
 }
 
-fn env_flag(key: &str) -> bool {
+fn env_flag_opt(key: &str) -> Option<bool> {
     match std::env::var(key) {
-        Ok(v) => matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"),
-        Err(_) => false,
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            if matches!(s.as_str(), "1" | "true" | "yes" | "on") {
+                Some(true)
+            } else if matches!(s.as_str(), "0" | "false" | "no" | "off") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
     }
 }
 
@@ -851,16 +928,9 @@ fn parse_thinking_mode(value: &str) -> ThinkingMode {
     }
 }
 
-fn env_default_thinking() -> ThinkingMode {
-    match std::env::var("FERMI_DEFAULT_THINKING") {
-        Ok(v) => parse_thinking_mode(&v),
-        Err(_) => ThinkingMode::Off,
-    }
-}
-
-fn supports_thinking(model_id: &str) -> bool {
-    if let Ok(v) = std::env::var("FERMI_SUPPORTS_THINKING") {
-        return matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on");
+fn supports_thinking(model_id: &str, override_value: Option<bool>) -> bool {
+    if let Some(v) = override_value {
+        return v;
     }
     let id = model_id.to_ascii_lowercase();
     id.contains("qwen") || id.contains("deepseek") || id.contains("r1") || id.contains("qwq")

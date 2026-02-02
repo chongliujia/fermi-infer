@@ -9,7 +9,8 @@ use fermi_grpc::fermi::fermi_server::{Fermi, FermiServer};
 use fermi_grpc::fermi::{GenerateRequest, GenerateResponse};
 use fermi_io::load_tokenizer;
 use fermi_runtime::{
-    GenerationConfig, InMemorySessionStore, InferenceEngine, ModelBuilder, SessionId, SessionStore,
+    GenerationConfig, InMemorySessionStore, InferenceEngine, ModelBuilder, SamplingDefaults,
+    SessionId, SessionStore, load_config, resolve_sampling_params, sampling_defaults_from_sources,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -25,6 +26,7 @@ struct FermiService {
     sessions: Arc<InMemorySessionStore>,
     max_position_embeddings: usize,
     timeout_ms: u64,
+    sampling_defaults: SamplingDefaults,
     default_system_prompt: Option<String>,
     disable_think: bool,
 }
@@ -69,6 +71,7 @@ impl FermiService {
         tokenizer: tokenizers::Tokenizer,
         max_position_embeddings: usize,
         timeout_ms: u64,
+        sampling_defaults: SamplingDefaults,
         session_ttl_ms: Option<u64>,
         session_max: Option<usize>,
         default_system_prompt: Option<String>,
@@ -86,12 +89,13 @@ impl FermiService {
             )),
             max_position_embeddings,
             timeout_ms,
+            sampling_defaults,
             default_system_prompt,
             disable_think,
         }
     }
 
-    fn build_gen_config(&self, req: &GenerateRequest) -> GenerationConfig {
+    fn build_gen_config(&self, req: &GenerateRequest) -> Result<GenerationConfig, Status> {
         let mut stop_tokens = Vec::new();
         if let Some(eos) = self.tokenizer.token_to_id("<|endoftext|>") {
             stop_tokens.push(eos);
@@ -100,33 +104,45 @@ impl FermiService {
             stop_tokens.push(im_end);
         }
 
-        let mut max_new_tokens = if req.max_new_tokens == 0 {
-            256
+        let requested_max_new_tokens = if req.max_new_tokens == 0 {
+            None
         } else {
-            req.max_new_tokens as usize
+            Some(req.max_new_tokens as usize)
         };
-        if max_new_tokens > Self::MAX_NEW_TOKENS {
-            max_new_tokens = Self::MAX_NEW_TOKENS;
-        }
-        let repeat_penalty = if req.repeat_penalty <= 0.0 {
-            1.1
+        // In proto3 scalar fields, omitted values default to 0.
+        let requested_temperature = if req.temperature <= 0.0 {
+            None
         } else {
-            req.repeat_penalty
+            Some(req.temperature)
         };
-        let temperature = if req.temperature <= 0.0 {
-            0.8
+        let requested_top_p = if req.top_p <= 0.0 {
+            None
         } else {
-            req.temperature
+            Some(req.top_p)
         };
-        let top_p = if req.top_p <= 0.0 { 0.95 } else { req.top_p };
+        let requested_repeat_penalty = if req.repeat_penalty <= 0.0 {
+            None
+        } else {
+            Some(req.repeat_penalty)
+        };
 
-        GenerationConfig {
-            max_new_tokens,
-            repeat_penalty,
+        let mut sampling = resolve_sampling_params(
+            requested_max_new_tokens,
+            requested_temperature,
+            requested_top_p,
+            requested_repeat_penalty,
+            &self.sampling_defaults,
+        )
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        sampling.max_new_tokens = sampling.max_new_tokens.min(Self::MAX_NEW_TOKENS);
+
+        Ok(GenerationConfig {
+            max_new_tokens: sampling.max_new_tokens,
+            repeat_penalty: sampling.repeat_penalty,
             stop_tokens,
-            temperature,
-            top_p,
-        }
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
+        })
     }
 
     fn get_engine_for_session(&self, session_id: &SessionId) -> Result<(usize, bool), Status> {
@@ -291,7 +307,7 @@ impl Fermi for FermiService {
         } else {
             req.session_id.clone()
         };
-        let gen_cfg = self.build_gen_config(&req);
+        let gen_cfg = self.build_gen_config(&req)?;
         if !self.sessions.try_begin(&session_id) {
             return Err(Status::resource_exhausted(
                 "session is busy; concurrent requests are not supported",
@@ -522,10 +538,19 @@ fn device_setup() -> AnyResult<Device> {
     Ok(Device::Cpu)
 }
 
-fn env_flag(key: &str) -> bool {
+fn env_flag_opt(key: &str) -> Option<bool> {
     match env::var(key) {
-        Ok(v) => matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"),
-        Err(_) => false,
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            if matches!(s.as_str(), "1" | "true" | "yes" | "on") {
+                Some(true)
+            } else if matches!(s.as_str(), "0" | "false" | "no" | "off") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
     }
 }
 
@@ -563,16 +588,31 @@ fn loop_detected(recent: &[u32]) -> bool {
 
 #[tokio::main]
 async fn main() -> AnyResult<()> {
+    let loaded_cfg = load_config(None)?;
+    if let Some(path) = &loaded_cfg.path {
+        println!("🧩 使用配置文件: {}", path.display());
+    }
+    let app_cfg = loaded_cfg.config;
+
     let device = device_setup()?;
     println!("🚀 gRPC 运行设备: {:?}", device);
 
-    let model_repo_id = env::var("FERMI_MODEL").unwrap_or_else(|_| "Qwen/Qwen3-1.7B".to_string());
-    let offline = env_flag("FERMI_OFFLINE") || env_flag("HF_HUB_OFFLINE");
+    let model_repo_id = env::var("FERMI_MODEL")
+        .ok()
+        .or_else(|| app_cfg.model.id.clone())
+        .unwrap_or_else(|| "Qwen/Qwen3-1.7B".to_string());
+    let offline = env_flag_opt("FERMI_OFFLINE")
+        .or_else(|| env_flag_opt("HF_HUB_OFFLINE"))
+        .or(app_cfg.model.offline)
+        .unwrap_or(false);
     println!("📥 准备模型文件: {} ...", model_repo_id);
     let builder = ModelBuilder::new(&model_repo_id, !offline)?;
     let max_position_embeddings = builder.max_position_embeddings();
 
-    let pool_size = env_u64("FERMI_ENGINE_POOL").unwrap_or(1).max(1) as usize;
+    let pool_size = env_u64("FERMI_ENGINE_POOL")
+        .or_else(|| app_cfg.grpc.engine_pool.and_then(|v| u64::try_from(v).ok()))
+        .unwrap_or(1)
+        .max(1) as usize;
     let mut engine_pool: Vec<Arc<Mutex<Box<dyn InferenceEngine>>>> = Vec::with_capacity(pool_size);
     for _ in 0..pool_size {
         let mut engine = builder.create_engine(&device)?;
@@ -582,20 +622,36 @@ async fn main() -> AnyResult<()> {
 
     let tokenizer = load_tokenizer(builder.tokenizer_path())?;
 
-    let addr = "0.0.0.0:50051".parse()?;
-    let timeout_ms = env_u64("FERMI_TIMEOUT_MS").unwrap_or(60_000);
-    let session_ttl_ms = env_u64("FERMI_SESSION_TTL_MS").filter(|v| *v > 0);
+    let addr = env::var("FERMI_GRPC_ADDR")
+        .ok()
+        .or(app_cfg.grpc.addr)
+        .unwrap_or_else(|| "0.0.0.0:50051".to_string())
+        .parse()?;
+    let timeout_ms = env_u64("FERMI_TIMEOUT_MS")
+        .or(app_cfg.grpc.timeout_ms)
+        .unwrap_or(60_000);
+    let sampling_defaults =
+        sampling_defaults_from_sources(app_cfg.generation.to_sampling_overrides())?;
+    let session_ttl_ms = env_u64("FERMI_SESSION_TTL_MS")
+        .or(app_cfg.grpc.session_ttl_ms)
+        .filter(|v| *v > 0);
     let session_max = env_u64("FERMI_SESSION_MAX")
         .and_then(|v| usize::try_from(v).ok())
+        .or(app_cfg.grpc.session_max)
         .filter(|v| *v > 0);
-    let default_system_prompt = env::var("FERMI_DEFAULT_SYSTEM_PROMPT").ok();
-    let disable_think = env_flag("FERMI_DISABLE_THINK");
+    let default_system_prompt = env::var("FERMI_DEFAULT_SYSTEM_PROMPT")
+        .ok()
+        .or(app_cfg.grpc.default_system_prompt);
+    let disable_think = env_flag_opt("FERMI_DISABLE_THINK")
+        .or(app_cfg.grpc.disable_think)
+        .unwrap_or(false);
     let service = FermiService::new(
         engine_pool,
         device,
         tokenizer,
         max_position_embeddings,
         timeout_ms,
+        sampling_defaults,
         session_ttl_ms,
         session_max,
         default_system_prompt,

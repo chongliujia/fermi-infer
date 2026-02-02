@@ -97,13 +97,56 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## 📦 Configuration
 
-Configure via Environment Variables:
+Fermi now supports a single config file (`fermi.toml`) with env/CLI overrides.
 
-*   `FERMI_MODEL`: Change the model ID (e.g., `export FERMI_MODEL=Qwen/Qwen3-3B`).
-*   `FERMI_ENGINE_POOL`: Number of concurrent model instances (HTTP server).
-*   `FERMI_OFFLINE=1`: Disable HuggingFace downloads (offline mode).
-*   `FERMI_SESSION_TTL_MS`: gRPC session idle TTL in milliseconds (`0`/unset means disabled).
-*   `FERMI_SESSION_MAX`: gRPC max in-memory sessions before LRU eviction.
+Auto-discovery order:
+*   `--config PATH` (CLI only)
+*   `FERMI_CONFIG=/path/to/file.toml`
+*   `./fermi.toml` (if present)
+
+Example `fermi.toml`:
+
+```toml
+[model]
+id = "Qwen/Qwen3-1.7B"
+offline = false
+
+[generation]
+default_max_new_tokens = 256
+max_new_tokens_cap = 9056
+temperature = 0.2
+top_p = 1.0
+repeat_penalty = 1.1
+
+[openai]
+addr = "0.0.0.0:8000"
+engine_pool = 1
+default_thinking = "off"
+supports_thinking = true
+disable_think = false
+
+[grpc]
+addr = "0.0.0.0:50051"
+engine_pool = 1
+timeout_ms = 60000
+session_ttl_ms = 0
+session_max = 0
+default_system_prompt = ""
+disable_think = false
+```
+
+You can start from `fermi.toml.example`.
+
+Useful environment overrides:
+*   `FERMI_MODEL`, `FERMI_OFFLINE`, `HF_HUB_OFFLINE`
+*   `FERMI_ENGINE_POOL`, `FERMI_OPENAI_ADDR`, `FERMI_GRPC_ADDR`, `FERMI_TIMEOUT_MS`
+*   `FERMI_SESSION_TTL_MS`, `FERMI_SESSION_MAX`, `FERMI_DEFAULT_SYSTEM_PROMPT`
+*   `FERMI_DEFAULT_THINKING`, `FERMI_SUPPORTS_THINKING`, `FERMI_DISABLE_THINK`
+*   `FERMI_DEFAULT_MAX_NEW_TOKENS`, `FERMI_MAX_NEW_TOKENS_CAP`
+*   `FERMI_DEFAULT_TEMPERATURE`, `FERMI_DEFAULT_TOP_P`, `FERMI_DEFAULT_REPEAT_PENALTY`
+
+Parameter precedence (uniform):
+*   Request/CLI argument > Environment variable > `fermi.toml` > built-in default.
 
 ## 🔧 API Compatibility Notes
 

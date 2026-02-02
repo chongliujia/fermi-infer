@@ -1,0 +1,26 @@
+[model]
+id = "Qwen/Qwen3-1.7B"
+offline = false
+
+[generation]
+default_max_new_tokens = 256
+max_new_tokens_cap = 9056
+temperature = 0.2
+top_p = 1.0
+repeat_penalty = 1.1
+
+[openai]
+addr = "0.0.0.0:8000"
+engine_pool = 1
+default_thinking = "off"
+supports_thinking = true
+disable_think = false
+
+[grpc]
+addr = "0.0.0.0:50051"
+engine_pool = 1
+timeout_ms = 60000
+session_ttl_ms = 0
+session_max = 0
+default_system_prompt = ""
+disable_think = false

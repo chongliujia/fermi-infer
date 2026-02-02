@@ -13,9 +13,9 @@ pub struct ModelBuilder {
 }
 
 impl ModelBuilder {
-    pub fn new(model_id: &str, offline: bool) -> Result<Self> {
+    pub fn new(model_id: &str, allow_network: bool) -> Result<Self> {
         // Future: detect architecture from config.json or model_id
-        let files = download_qwen3_files(model_id, !offline)?;
+        let files = download_qwen3_files(model_id, allow_network)?;
         let config = load_qwen3_config(&files.config)?;
         Ok(Self { files, config })
     }
