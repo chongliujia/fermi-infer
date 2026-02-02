@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     if let Some(path) = &loaded_cfg.path {
         println!("🧩 配置文件: {}", path.display());
     }
-    let app_cfg = loaded_cfg.config;
+    let app_cfg = loaded_cfg.config.clone();
     // 1. 基础环境设置
     let device = device_setup()?;
     println!("🚀 运行设备: {:?}", device);
@@ -80,7 +80,24 @@ fn main() -> Result<()> {
         top_p: sampling.top_p,
     };
     let max_ctx = builder.max_position_embeddings();
-    let timeout_ms = cli_cfg.timeout_ms;
+    let timeout_ms = cli_cfg
+        .timeout_ms
+        .or_else(|| env_u64("FERMI_TIMEOUT_MS"))
+        .or(app_cfg.cli.timeout_ms)
+        .unwrap_or(60_000);
+    let disable_think = env_flag_opt("FERMI_DISABLE_THINK")
+        .or(app_cfg.cli.disable_think)
+        .unwrap_or(false);
+    let mut default_system_prompt = resolve_default_system_prompt(
+        env::var("FERMI_DEFAULT_SYSTEM_PROMPT").ok(),
+        env::var("FERMI_DEFAULT_SYSTEM_PROMPT_FILE").ok(),
+        app_cfg.cli.default_system_prompt.clone(),
+        app_cfg.cli.default_system_prompt_file.clone(),
+        &loaded_cfg,
+    )?;
+    if disable_think {
+        default_system_prompt = Some(append_disable_think_hint(default_system_prompt.as_deref()));
+    }
 
     loop {
         print!("> ");
@@ -112,15 +129,24 @@ fn main() -> Result<()> {
 
         let mut offset = if has_context { current_pos } else { 0 };
         let mut input_ids = tokenizer
-            .encode(render_user_chunk(line, has_context), false)
+            .encode(
+                render_user_chunk(line, has_context, default_system_prompt.as_deref()),
+                false,
+            )
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
         let expected_max = offset + input_ids.len() + gen_cfg.max_new_tokens + 8;
         if expected_max > max_ctx {
             let pairs = history_pairs(&history);
-            let (trunc_ids, kept_pairs) =
-                build_truncated_prompt(&pairs, line, &tokenizer, max_ctx, gen_cfg.max_new_tokens)?;
+            let (trunc_ids, kept_pairs) = build_truncated_prompt(
+                &pairs,
+                line,
+                default_system_prompt.as_deref(),
+                &tokenizer,
+                max_ctx,
+                gen_cfg.max_new_tokens,
+            )?;
             if trunc_ids.len() >= max_ctx {
                 println!("⚠️ 输入过长，已超过最大上下文 {} tokens", max_ctx);
                 continue;
@@ -253,7 +279,7 @@ struct CliConfig {
     model: Option<String>,
     offline: Option<bool>,
     config: Option<String>,
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
 }
 
 fn parse_args() -> Result<CliConfig> {
@@ -264,7 +290,7 @@ fn parse_args() -> Result<CliConfig> {
     let mut model: Option<String> = None;
     let mut offline: Option<bool> = None;
     let mut config: Option<String> = None;
-    let mut timeout_ms: u64 = 60_000;
+    let mut timeout_ms: Option<u64> = None;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -291,7 +317,7 @@ fn parse_args() -> Result<CliConfig> {
             }
             "--timeout-ms" => {
                 if let Some(v) = args.next() {
-                    timeout_ms = v.parse::<u64>().map_err(E::msg)?;
+                    timeout_ms = Some(v.parse::<u64>().map_err(E::msg)?);
                 } else {
                     return Err(E::msg("--timeout-ms requires a value"));
                 }
@@ -381,6 +407,53 @@ fn env_flag_opt(key: &str) -> Option<bool> {
     }
 }
 
+fn env_u64(key: &str) -> Option<u64> {
+    env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+}
+
+fn resolve_default_system_prompt(
+    env_inline: Option<String>,
+    env_file: Option<String>,
+    cfg_inline: Option<String>,
+    cfg_file: Option<String>,
+    loaded_cfg: &fermi_runtime::LoadedConfig,
+) -> Result<Option<String>> {
+    if let Some(prompt) = normalize_prompt_text(env_inline) {
+        return Ok(Some(prompt));
+    }
+    if let Some(path) = normalize_prompt_text(env_file) {
+        let prompt = loaded_cfg.read_text_file(&path).map_err(E::msg)?;
+        return Ok(normalize_prompt_text(Some(prompt)));
+    }
+    if let Some(prompt) = normalize_prompt_text(cfg_inline) {
+        return Ok(Some(prompt));
+    }
+    if let Some(path) = normalize_prompt_text(cfg_file) {
+        let prompt = loaded_cfg.read_text_file(&path).map_err(E::msg)?;
+        return Ok(normalize_prompt_text(Some(prompt)));
+    }
+    Ok(None)
+}
+
+fn normalize_prompt_text(v: Option<String>) -> Option<String> {
+    v.and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
+}
+
+fn append_disable_think_hint(base: Option<&str>) -> String {
+    let suffix = "请直接给出最终答案，不输出思考过程，也不要输出<think>标签。";
+    match base.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => format!("{s}\n{suffix}"),
+        None => suffix.to_string(),
+    }
+}
+
 fn loop_detected(recent: &[u32]) -> bool {
     if recent.len() >= 4 {
         let tail = &recent[recent.len() - 4..];
@@ -423,8 +496,19 @@ fn history_pairs(history: &[(String, String)]) -> Vec<(String, String)> {
     pairs
 }
 
-fn render_history_prompt(pairs: &[(String, String)], user_text: &str) -> String {
+fn render_history_prompt(
+    pairs: &[(String, String)],
+    user_text: &str,
+    system_prompt: Option<&str>,
+) -> String {
     let mut out = String::new();
+    if let Some(sys) = system_prompt {
+        if !sys.is_empty() {
+            out.push_str("<|im_start|>system\n");
+            out.push_str(sys);
+            out.push_str("<|im_end|>\n");
+        }
+    }
     for (user, assistant) in pairs {
         out.push_str("<|im_start|>user\n");
         out.push_str(user);
@@ -441,6 +525,7 @@ fn render_history_prompt(pairs: &[(String, String)], user_text: &str) -> String 
 fn build_truncated_prompt(
     pairs: &[(String, String)],
     user_text: &str,
+    system_prompt: Option<&str>,
     tokenizer: &Tokenizer,
     max_ctx: usize,
     max_new_tokens: usize,
@@ -448,7 +533,7 @@ fn build_truncated_prompt(
     let mut start = 0usize;
     loop {
         let kept = &pairs[start..];
-        let prompt = render_history_prompt(kept, user_text);
+        let prompt = render_history_prompt(kept, user_text, system_prompt);
         let tokens = tokenizer.encode(prompt.clone(), false).map_err(E::msg)?;
         let input_ids = tokens.get_ids().to_vec();
         let expected_max = input_ids.len() + max_new_tokens + 8;
@@ -459,10 +544,16 @@ fn build_truncated_prompt(
     }
 }
 
-fn render_user_chunk(user_text: &str, has_context: bool) -> String {
+fn render_user_chunk(user_text: &str, has_context: bool, system_prompt: Option<&str>) -> String {
     let mut out = String::new();
     if has_context {
         out.push('\n');
+    } else if let Some(sys) = system_prompt {
+        if !sys.is_empty() {
+            out.push_str("<|im_start|>system\n");
+            out.push_str(sys);
+            out.push_str("<|im_end|>\n");
+        }
     }
     out.push_str("<|im_start|>user\n");
     out.push_str(user_text);

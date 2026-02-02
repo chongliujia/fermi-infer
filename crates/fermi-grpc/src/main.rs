@@ -558,6 +558,41 @@ fn env_u64(key: &str) -> Option<u64> {
     env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
 }
 
+fn resolve_default_system_prompt(
+    loaded_cfg: &fermi_runtime::LoadedConfig,
+    env_inline: Option<String>,
+    env_file: Option<String>,
+    cfg_inline: Option<String>,
+    cfg_file: Option<String>,
+) -> AnyResult<Option<String>> {
+    if let Some(prompt) = normalize_prompt_text(env_inline) {
+        return Ok(Some(prompt));
+    }
+    if let Some(path) = normalize_prompt_text(env_file) {
+        let prompt = loaded_cfg.read_text_file(&path)?;
+        return Ok(normalize_prompt_text(Some(prompt)));
+    }
+    if let Some(prompt) = normalize_prompt_text(cfg_inline) {
+        return Ok(Some(prompt));
+    }
+    if let Some(path) = normalize_prompt_text(cfg_file) {
+        let prompt = loaded_cfg.read_text_file(&path)?;
+        return Ok(normalize_prompt_text(Some(prompt)));
+    }
+    Ok(None)
+}
+
+fn normalize_prompt_text(v: Option<String>) -> Option<String> {
+    v.and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
+}
+
 fn loop_detected(recent: &[u32]) -> bool {
     if recent.len() >= 4 {
         let tail = &recent[recent.len() - 4..];
@@ -592,7 +627,7 @@ async fn main() -> AnyResult<()> {
     if let Some(path) = &loaded_cfg.path {
         println!("🧩 使用配置文件: {}", path.display());
     }
-    let app_cfg = loaded_cfg.config;
+    let app_cfg = loaded_cfg.config.clone();
 
     let device = device_setup()?;
     println!("🚀 gRPC 运行设备: {:?}", device);
@@ -639,9 +674,13 @@ async fn main() -> AnyResult<()> {
         .and_then(|v| usize::try_from(v).ok())
         .or(app_cfg.grpc.session_max)
         .filter(|v| *v > 0);
-    let default_system_prompt = env::var("FERMI_DEFAULT_SYSTEM_PROMPT")
-        .ok()
-        .or(app_cfg.grpc.default_system_prompt);
+    let default_system_prompt = resolve_default_system_prompt(
+        &loaded_cfg,
+        env::var("FERMI_DEFAULT_SYSTEM_PROMPT").ok(),
+        env::var("FERMI_DEFAULT_SYSTEM_PROMPT_FILE").ok(),
+        app_cfg.grpc.default_system_prompt.clone(),
+        app_cfg.grpc.default_system_prompt_file.clone(),
+    )?;
     let disable_think = env_flag_opt("FERMI_DISABLE_THINK")
         .or(app_cfg.grpc.disable_think)
         .unwrap_or(false);

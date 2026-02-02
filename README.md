@@ -118,9 +118,17 @@ temperature = 0.2
 top_p = 1.0
 repeat_penalty = 1.1
 
+[cli]
+timeout_ms = 60000
+default_system_prompt = ""
+default_system_prompt_file = "prompts/system.txt"
+disable_think = false
+
 [openai]
 addr = "0.0.0.0:8000"
 engine_pool = 1
+default_system_prompt = ""
+default_system_prompt_file = "prompts/system.txt"
 default_thinking = "off"
 supports_thinking = true
 disable_think = false
@@ -132,6 +140,7 @@ timeout_ms = 60000
 session_ttl_ms = 0
 session_max = 0
 default_system_prompt = ""
+default_system_prompt_file = "prompts/system.txt"
 disable_think = false
 ```
 
@@ -140,7 +149,8 @@ You can start from `fermi.toml.example`.
 Useful environment overrides:
 *   `FERMI_MODEL`, `FERMI_OFFLINE`, `HF_HUB_OFFLINE`
 *   `FERMI_ENGINE_POOL`, `FERMI_OPENAI_ADDR`, `FERMI_GRPC_ADDR`, `FERMI_TIMEOUT_MS`
-*   `FERMI_SESSION_TTL_MS`, `FERMI_SESSION_MAX`, `FERMI_DEFAULT_SYSTEM_PROMPT`
+*   `FERMI_SESSION_TTL_MS`, `FERMI_SESSION_MAX`
+*   `FERMI_DEFAULT_SYSTEM_PROMPT`, `FERMI_DEFAULT_SYSTEM_PROMPT_FILE`
 *   `FERMI_DEFAULT_THINKING`, `FERMI_SUPPORTS_THINKING`, `FERMI_DISABLE_THINK`
 *   `FERMI_DEFAULT_MAX_NEW_TOKENS`, `FERMI_MAX_NEW_TOKENS_CAP`
 *   `FERMI_DEFAULT_TEMPERATURE`, `FERMI_DEFAULT_TOP_P`, `FERMI_DEFAULT_REPEAT_PENALTY`

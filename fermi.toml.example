@@ -9,9 +9,17 @@ temperature = 0.2
 top_p = 1.0
 repeat_penalty = 1.1
 
+[cli]
+timeout_ms = 60000
+default_system_prompt = ""
+default_system_prompt_file = "prompts/system.txt"
+disable_think = false
+
 [openai]
 addr = "0.0.0.0:8000"
 engine_pool = 1
+default_system_prompt = ""
+default_system_prompt_file = "prompts/system.txt"
 default_thinking = "off"
 supports_thinking = true
 disable_think = false
@@ -23,4 +31,5 @@ timeout_ms = 60000
 session_ttl_ms = 0
 session_max = 0
 default_system_prompt = ""
+default_system_prompt_file = "prompts/system.txt"
 disable_think = false

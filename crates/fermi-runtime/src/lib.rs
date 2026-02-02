@@ -5,7 +5,7 @@ pub mod sampling;
 pub mod session;
 
 pub use config::{
-    AppConfig, DEFAULT_CONFIG_FILE, GenerationDefaultsConfig, GrpcConfig, LoadedConfig,
+    AppConfig, CliConfig, DEFAULT_CONFIG_FILE, GenerationDefaultsConfig, GrpcConfig, LoadedConfig,
     ModelConfig, OpenAiConfig, load_config,
 };
 pub use engine::{GenerationConfig, InferenceEngine, PrefillOutput, Qwen3Engine};

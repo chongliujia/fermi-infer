@@ -133,9 +133,17 @@ temperature = 0.2
 top_p = 1.0
 repeat_penalty = 1.1
 
+[cli]
+timeout_ms = 60000
+default_system_prompt = ""
+default_system_prompt_file = "prompts/system.txt"
+disable_think = false
+
 [openai]
 addr = "0.0.0.0:8000"
 engine_pool = 1
+default_system_prompt = ""
+default_system_prompt_file = "prompts/system.txt"
 default_thinking = "off"
 supports_thinking = true
 disable_think = false
@@ -147,6 +155,7 @@ timeout_ms = 60000
 session_ttl_ms = 0
 session_max = 0
 default_system_prompt = ""
+default_system_prompt_file = "prompts/system.txt"
 disable_think = false
 ```
 
@@ -157,6 +166,7 @@ disable_think = false
 - `FERMI_ENGINE_POOL` HTTP 服务器实例数量
 - `FERMI_OPENAI_ADDR` HTTP 监听地址
 - `FERMI_GRPC_ADDR` gRPC 监听地址
+- `FERMI_DEFAULT_SYSTEM_PROMPT` / `FERMI_DEFAULT_SYSTEM_PROMPT_FILE` 默认系统提示词（文本或文件）
 - `FERMI_DEFAULT_THINKING` / `FERMI_SUPPORTS_THINKING` / `FERMI_DISABLE_THINK`
 - `FERMI_SESSION_TTL_MS` gRPC 会话空闲 TTL（毫秒，未设置或 `0` 表示关闭）
 - `FERMI_SESSION_MAX` gRPC 内存会话上限（超过后按 LRU 回收）

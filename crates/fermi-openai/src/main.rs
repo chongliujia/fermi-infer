@@ -42,6 +42,7 @@ struct AppState {
     stop_tokens: Vec<u32>,
     model_id: String,
     max_position_embeddings: usize,
+    default_system_prompt: Option<String>,
     disable_think: bool,
     default_thinking: ThinkingMode,
     supports_thinking_override: Option<bool>,
@@ -173,7 +174,7 @@ async fn main() -> AnyResult<()> {
     if let Some(path) = &loaded_cfg.path {
         info!("loaded config file: {}", path.display());
     }
-    let app_cfg = loaded_cfg.config;
+    let app_cfg = loaded_cfg.config.clone();
 
     let device = device_setup()?;
     info!("openai server device: {:?}", device);
@@ -202,6 +203,13 @@ async fn main() -> AnyResult<()> {
         .unwrap_or(ThinkingMode::Off);
     let supports_thinking_override =
         env_flag_opt("FERMI_SUPPORTS_THINKING").or(app_cfg.openai.supports_thinking);
+    let default_system_prompt = resolve_default_system_prompt(
+        &loaded_cfg,
+        std::env::var("FERMI_DEFAULT_SYSTEM_PROMPT").ok(),
+        std::env::var("FERMI_DEFAULT_SYSTEM_PROMPT_FILE").ok(),
+        app_cfg.openai.default_system_prompt.clone(),
+        app_cfg.openai.default_system_prompt_file.clone(),
+    )?;
 
     info!("model: {}", model_id);
 
@@ -239,6 +247,7 @@ async fn main() -> AnyResult<()> {
         stop_tokens,
         model_id: model_id.clone(),
         max_position_embeddings: builder.max_position_embeddings(),
+        default_system_prompt,
         disable_think,
         default_thinking,
         supports_thinking_override,
@@ -334,7 +343,11 @@ async fn chat_completions(
         }
     }
 
-    let prompt = build_prompt(&req.messages, think_mode);
+    let prompt = build_prompt(
+        &req.messages,
+        think_mode,
+        state.default_system_prompt.as_deref(),
+    );
     let prompt_tokens = match state.tokenizer.encode(prompt.clone(), false) {
         Ok(tokens) => tokens.get_ids().len(),
         Err(err) => {
@@ -438,7 +451,11 @@ async fn responses(
         Ok(m) => m,
         Err(err) => return openai_error(StatusCode::BAD_REQUEST, err, "invalid_request_error"),
     };
-    let prompt = build_prompt(&messages, ThinkingMode::Off);
+    let prompt = build_prompt(
+        &messages,
+        ThinkingMode::Off,
+        state.default_system_prompt.as_deref(),
+    );
 
     let prompt_tokens = match state.tokenizer.encode(prompt.clone(), false) {
         Ok(tokens) => tokens.get_ids().len(),
@@ -757,8 +774,23 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
         .into_response()
 }
 
-fn build_prompt(messages: &[ChatMessage], think_mode: ThinkingMode) -> String {
+fn build_prompt(
+    messages: &[ChatMessage],
+    think_mode: ThinkingMode,
+    default_system_prompt: Option<&str>,
+) -> String {
     let mut out = String::new();
+    let has_explicit_system = messages
+        .iter()
+        .any(|msg| matches!(msg.role.as_str(), "system" | "developer"));
+    if !has_explicit_system && let Some(sys) = default_system_prompt {
+        let sys = sys.trim();
+        if !sys.is_empty() {
+            out.push_str("<|im_start|>system\n");
+            out.push_str(sys);
+            out.push_str("<|im_end|>\n");
+        }
+    }
 
     for msg in messages {
         let role = msg.role.as_str();
@@ -990,6 +1022,41 @@ fn resolve_model(requested: Option<&str>, loaded: &str) -> Result<String, String
 
 fn env_u64(key: &str) -> Option<u64> {
     std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+}
+
+fn resolve_default_system_prompt(
+    loaded_cfg: &fermi_runtime::LoadedConfig,
+    env_inline: Option<String>,
+    env_file: Option<String>,
+    cfg_inline: Option<String>,
+    cfg_file: Option<String>,
+) -> AnyResult<Option<String>> {
+    if let Some(prompt) = normalize_prompt_text(env_inline) {
+        return Ok(Some(prompt));
+    }
+    if let Some(path) = normalize_prompt_text(env_file) {
+        let prompt = loaded_cfg.read_text_file(&path)?;
+        return Ok(normalize_prompt_text(Some(prompt)));
+    }
+    if let Some(prompt) = normalize_prompt_text(cfg_inline) {
+        return Ok(Some(prompt));
+    }
+    if let Some(path) = normalize_prompt_text(cfg_file) {
+        let prompt = loaded_cfg.read_text_file(&path)?;
+        return Ok(normalize_prompt_text(Some(prompt)));
+    }
+    Ok(None)
+}
+
+fn normalize_prompt_text(v: Option<String>) -> Option<String> {
+    v.and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
 }
 
 struct Utf8Buffer {

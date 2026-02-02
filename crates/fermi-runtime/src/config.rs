@@ -10,6 +10,7 @@ pub const DEFAULT_CONFIG_FILE: &str = "fermi.toml";
 pub struct AppConfig {
     pub model: ModelConfig,
     pub generation: GenerationDefaultsConfig,
+    pub cli: CliConfig,
     pub openai: OpenAiConfig,
     pub grpc: GrpcConfig,
 }
@@ -45,6 +46,8 @@ impl GenerationDefaultsConfig {
 pub struct OpenAiConfig {
     pub addr: Option<String>,
     pub engine_pool: Option<usize>,
+    pub default_system_prompt: Option<String>,
+    pub default_system_prompt_file: Option<String>,
     pub default_thinking: Option<String>,
     pub supports_thinking: Option<bool>,
     pub disable_think: Option<bool>,
@@ -58,6 +61,15 @@ pub struct GrpcConfig {
     pub session_ttl_ms: Option<u64>,
     pub session_max: Option<usize>,
     pub default_system_prompt: Option<String>,
+    pub default_system_prompt_file: Option<String>,
+    pub disable_think: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CliConfig {
+    pub timeout_ms: Option<u64>,
+    pub default_system_prompt: Option<String>,
+    pub default_system_prompt_file: Option<String>,
     pub disable_think: Option<bool>,
 }
 
@@ -73,6 +85,7 @@ enum Section {
     Root,
     Model,
     Generation,
+    Cli,
     OpenAi,
     Grpc,
 }
@@ -94,6 +107,27 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<LoadedConfig> {
             path: None,
             config: AppConfig::default(),
         }),
+    }
+}
+
+impl LoadedConfig {
+    pub fn resolve_path(&self, path: &str) -> PathBuf {
+        let candidate = PathBuf::from(path);
+        if candidate.is_absolute() {
+            return candidate;
+        }
+        if let Some(config_path) = &self.path
+            && let Some(parent) = config_path.parent()
+        {
+            return parent.join(candidate);
+        }
+        candidate
+    }
+
+    pub fn read_text_file(&self, path: &str) -> Result<String> {
+        let resolved = self.resolve_path(path);
+        std::fs::read_to_string(&resolved)
+            .with_context(|| format!("failed to read text file '{}'", resolved.display()))
     }
 }
 
@@ -133,6 +167,7 @@ fn parse_config(input: &str) -> Result<AppConfig> {
             section = match name.as_str() {
                 "model" => Section::Model,
                 "generation" => Section::Generation,
+                "cli" => Section::Cli,
                 "openai" => Section::OpenAi,
                 "grpc" => Section::Grpc,
                 other => bail!("line {}: unknown section [{}]", line_no, other),
@@ -171,9 +206,26 @@ fn parse_config(input: &str) -> Result<AppConfig> {
                 }
                 _ => bail!("line {}: unknown generation key '{}'", line_no, key),
             },
+            Section::Cli => match key.as_str() {
+                "timeout_ms" => cfg.cli.timeout_ms = Some(parse_u64(value, line_no)?),
+                "default_system_prompt" => {
+                    cfg.cli.default_system_prompt = Some(parse_string(value, line_no)?)
+                }
+                "default_system_prompt_file" => {
+                    cfg.cli.default_system_prompt_file = Some(parse_string(value, line_no)?)
+                }
+                "disable_think" => cfg.cli.disable_think = Some(parse_bool(value, line_no)?),
+                _ => bail!("line {}: unknown cli key '{}'", line_no, key),
+            },
             Section::OpenAi => match key.as_str() {
                 "addr" => cfg.openai.addr = Some(parse_string(value, line_no)?),
                 "engine_pool" => cfg.openai.engine_pool = Some(parse_usize(value, line_no)?),
+                "default_system_prompt" => {
+                    cfg.openai.default_system_prompt = Some(parse_string(value, line_no)?)
+                }
+                "default_system_prompt_file" => {
+                    cfg.openai.default_system_prompt_file = Some(parse_string(value, line_no)?)
+                }
                 "default_thinking" => {
                     cfg.openai.default_thinking = Some(parse_string(value, line_no)?)
                 }
@@ -191,6 +243,9 @@ fn parse_config(input: &str) -> Result<AppConfig> {
                 "session_max" => cfg.grpc.session_max = Some(parse_usize(value, line_no)?),
                 "default_system_prompt" => {
                     cfg.grpc.default_system_prompt = Some(parse_string(value, line_no)?)
+                }
+                "default_system_prompt_file" => {
+                    cfg.grpc.default_system_prompt_file = Some(parse_string(value, line_no)?)
                 }
                 "disable_think" => cfg.grpc.disable_think = Some(parse_bool(value, line_no)?),
                 _ => bail!("line {}: unknown grpc key '{}'", line_no, key),
@@ -261,4 +316,50 @@ fn parse_f32(raw: &str, line_no: usize) -> Result<f32> {
     parse_string(raw, line_no)?
         .parse::<f32>()
         .map_err(|e| anyhow::anyhow!("line {}: invalid f32 '{}': {}", line_no, raw, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_prompt_file_keys() {
+        let cfg = parse_config(
+            r#"
+[cli]
+default_system_prompt_file = "prompts/cli.txt"
+
+[openai]
+default_system_prompt_file = "prompts/openai.txt"
+
+[grpc]
+default_system_prompt_file = "prompts/grpc.txt"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            cfg.cli.default_system_prompt_file.as_deref(),
+            Some("prompts/cli.txt")
+        );
+        assert_eq!(
+            cfg.openai.default_system_prompt_file.as_deref(),
+            Some("prompts/openai.txt")
+        );
+        assert_eq!(
+            cfg.grpc.default_system_prompt_file.as_deref(),
+            Some("prompts/grpc.txt")
+        );
+    }
+
+    #[test]
+    fn resolves_relative_path_from_config_dir() {
+        let loaded = LoadedConfig {
+            path: Some(PathBuf::from("/tmp/fermi/fermi.toml")),
+            config: AppConfig::default(),
+        };
+        assert_eq!(
+            loaded.resolve_path("prompts/system.txt"),
+            PathBuf::from("/tmp/fermi/prompts/system.txt")
+        );
+    }
 }
