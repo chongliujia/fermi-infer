@@ -150,8 +150,9 @@ impl Attention {
             let (k_cat, v_cat) = self.concat_cache()?;
             let k_rep = self.repeat_kv(&k_cat)?;
             let v_rep = self.repeat_kv(&v_cat)?;
-
-            let att = (q.matmul(&k_rep.t()?)? / (self.head_dim as f64).sqrt())?;
+            let q_mat = q.contiguous()?;
+            let k_t = k_rep.transpose(2, 3)?.contiguous()?;
+            let att = (q_mat.matmul(&k_t)? / (self.head_dim as f64).sqrt())?;
             let att = if seq_len > 1 {
                 let mask = self.causal_mask(seq_len, prev_cache_len, att.dtype(), x.device())?;
                 att.broadcast_add(&mask)?
@@ -276,11 +277,13 @@ impl Attention {
     }
 
     fn segmented_attention(&self, q: &Tensor, segments: &[(&Tensor, &Tensor)]) -> Result<Tensor> {
+        let q_mat = q.contiguous()?;
         let mut scores: Vec<Tensor> = Vec::with_capacity(segments.len());
         let mut max_per_segment: Option<Tensor> = None;
         for (k_seg, _) in segments {
             let k_rep = self.repeat_kv(k_seg)?;
-            let seg_scores = (q.matmul(&k_rep.t()?)? / (self.head_dim as f64).sqrt())?;
+            let k_t = k_rep.transpose(2, 3)?.contiguous()?;
+            let seg_scores = (q_mat.matmul(&k_t)? / (self.head_dim as f64).sqrt())?;
             let seg_max = seg_scores.max_keepdim(3)?;
             max_per_segment = Some(match max_per_segment {
                 Some(m) => m.maximum(&seg_max)?,
@@ -313,7 +316,7 @@ impl Attention {
 
         let mut output: Option<Tensor> = None;
         for (exp, (_, v_seg)) in exp_scores.into_iter().zip(segments.iter()) {
-            let v_rep = self.repeat_kv(v_seg)?;
+            let v_rep = self.repeat_kv(v_seg)?.contiguous()?;
             let weight = exp.broadcast_div(&denom)?;
             let seg_out = weight.matmul(&v_rep)?;
             output = Some(match output {
