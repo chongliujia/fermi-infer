@@ -1,5 +1,7 @@
 use anyhow::{Error as E, Result};
-use fermi_models::{phi3::Config as Phi3Config, qwen3::Config as QwenConfig};
+use fermi_models::{
+    llama::Config as LlamaConfig, phi3::Config as Phi3Config, qwen3::Config as QwenConfig,
+};
 use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -8,8 +10,33 @@ use tokenizers::Tokenizer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelArch {
     Qwen,
+    Llama,
     Phi3,
 }
+
+struct ModelArchRegistration {
+    arch: ModelArch,
+    model_type_prefixes: &'static [&'static str],
+    architecture_substrings: &'static [&'static str],
+}
+
+const MODEL_ARCH_REGISTRY: &[ModelArchRegistration] = &[
+    ModelArchRegistration {
+        arch: ModelArch::Qwen,
+        model_type_prefixes: &["qwen"],
+        architecture_substrings: &["qwen"],
+    },
+    ModelArchRegistration {
+        arch: ModelArch::Llama,
+        model_type_prefixes: &["llama"],
+        architecture_substrings: &["llama"],
+    },
+    ModelArchRegistration {
+        arch: ModelArch::Phi3,
+        model_type_prefixes: &["phi"],
+        architecture_substrings: &["phi"],
+    },
+];
 
 pub struct ModelFiles {
     pub tokenizer: PathBuf,
@@ -40,12 +67,14 @@ pub fn download_model_files(model_repo_id: &str, allow_network: bool) -> Result<
     let api = ApiBuilder::from_env().with_token(token).build()?;
     let repo = api.repo(Repo::new(model_repo_id.to_string(), RepoType::Model));
 
-    let tokenizer = repo.get("tokenizer.json")?;
-    let config = repo.get("config.json")?;
+    let tokenizer = hf_repo_get(&repo, model_repo_id, "tokenizer.json")?;
+    let config = hf_repo_get(&repo, model_repo_id, "config.json")?;
 
-    let weights = if let Ok(single) = repo.get("model.safetensors") {
+    let weights = if let Ok(single) = hf_repo_get(&repo, model_repo_id, "model.safetensors") {
         vec![single]
-    } else if let Ok(index_path) = repo.get("model.safetensors.index.json") {
+    } else if let Ok(index_path) =
+        hf_repo_get(&repo, model_repo_id, "model.safetensors.index.json")
+    {
         let names = parse_safetensor_index(&index_path)?;
         if names.is_empty() {
             return Err(E::msg(
@@ -54,7 +83,7 @@ pub fn download_model_files(model_repo_id: &str, allow_network: bool) -> Result<
         }
         let mut files = Vec::with_capacity(names.len());
         for name in names {
-            files.push(repo.get(&name)?);
+            files.push(hf_repo_get(&repo, model_repo_id, &name)?);
         }
         files
     } else {
@@ -107,6 +136,51 @@ fn try_hf_cache_model_files(model_repo_id: &str) -> Result<Option<ModelFiles>> {
         config,
         weights,
     }))
+}
+
+fn hf_repo_get(
+    repo: &hf_hub::api::sync::ApiRepo,
+    model_repo_id: &str,
+    filename: &str,
+) -> Result<PathBuf> {
+    repo.get(filename).map_err(|err| {
+        E::msg(format_hf_download_error_message(
+            model_repo_id,
+            filename,
+            &err.to_string(),
+        ))
+    })
+}
+
+fn format_hf_download_error_message(model_repo_id: &str, filename: &str, err: &str) -> String {
+    let mut message = format!(
+        "failed to download '{}' from Hugging Face repo '{}': {}",
+        filename, model_repo_id, err
+    );
+
+    let lowered = err.to_ascii_lowercase();
+    if lowered.contains("status code 401")
+        || lowered.contains("status code 403")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+        || lowered.contains("gated")
+    {
+        message.push_str(
+            "\n\nThis model may be gated or private. Request access on Hugging Face first:",
+        );
+        message.push_str(&format!("\n  https://huggingface.co/{}", model_repo_id));
+        message.push_str(
+            "\n\nThen configure an access token in your shell before running fermi-infer:",
+        );
+        message.push_str("\n  export HF_TOKEN=hf_your_token_here");
+        message.push_str("\n  # or");
+        message.push_str("\n  export HUGGINGFACE_HUB_TOKEN=hf_your_token_here");
+        message.push_str(
+            "\n\nIf you already have access, verify that the token is valid and that the current shell session can read it.",
+        );
+    }
+
+    message
 }
 
 fn try_local_model_files(dir: &Path) -> Result<Option<ModelFiles>> {
@@ -213,11 +287,14 @@ pub fn detect_model_arch(path: impl AsRef<Path>) -> Result<ModelArch> {
         .and_then(|v| v.as_str())
         .map(|v| v.to_ascii_lowercase());
     if let Some(mt) = model_type {
-        if mt.starts_with("qwen") {
-            return Ok(ModelArch::Qwen);
-        }
-        if mt.starts_with("phi") {
-            return Ok(ModelArch::Phi3);
+        for registration in MODEL_ARCH_REGISTRY {
+            if registration
+                .model_type_prefixes
+                .iter()
+                .any(|prefix| mt.starts_with(prefix))
+            {
+                return Ok(registration.arch);
+            }
         }
     }
 
@@ -227,11 +304,14 @@ pub fn detect_model_arch(path: impl AsRef<Path>) -> Result<ModelArch> {
                 continue;
             };
             let lowered = name.to_ascii_lowercase();
-            if lowered.contains("qwen") {
-                return Ok(ModelArch::Qwen);
-            }
-            if lowered.contains("phi") {
-                return Ok(ModelArch::Phi3);
+            for registration in MODEL_ARCH_REGISTRY {
+                if registration
+                    .architecture_substrings
+                    .iter()
+                    .any(|needle| lowered.contains(needle))
+                {
+                    return Ok(registration.arch);
+                }
             }
         }
     }
@@ -248,10 +328,10 @@ pub fn load_qwen_config(path: impl AsRef<Path>) -> Result<QwenConfig> {
             .get("max_position_embeddings")
             .and_then(|v| v.as_u64())
             .unwrap_or(32768);
-        if obj.get("num_key_value_heads").is_none()
-            && let Some(v) = obj.get("num_attention_heads").cloned()
-        {
-            obj.insert("num_key_value_heads".to_string(), v);
+        if obj.get("num_key_value_heads").is_none() {
+            if let Some(v) = obj.get("num_attention_heads").cloned() {
+                obj.insert("num_key_value_heads".to_string(), v);
+            }
         }
         if obj.get("head_dim").is_none() {
             let hidden = obj.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -285,13 +365,48 @@ pub fn load_phi3_config(path: impl AsRef<Path>) -> Result<Phi3Config> {
     let config_content = std::fs::read_to_string(path)?;
     let mut config_value: serde_json::Value = serde_json::from_str(&config_content)?;
     if let Some(obj) = config_value.as_object_mut() {
-        if obj.get("num_key_value_heads").is_none()
-            && let Some(v) = obj.get("num_attention_heads").cloned()
-        {
-            obj.insert("num_key_value_heads".to_string(), v);
+        if obj.get("num_key_value_heads").is_none() {
+            if let Some(v) = obj.get("num_attention_heads").cloned() {
+                obj.insert("num_key_value_heads".to_string(), v);
+            }
         }
     }
     let config: Phi3Config = serde_json::from_value(config_value)?;
+    Ok(config)
+}
+
+pub fn load_llama_config(path: impl AsRef<Path>) -> Result<LlamaConfig> {
+    let config_content = std::fs::read_to_string(path)?;
+    let mut config_value: serde_json::Value = serde_json::from_str(&config_content)?;
+
+    if let Some(obj) = config_value.as_object_mut() {
+        if obj.get("num_key_value_heads").is_none() {
+            if let Some(v) = obj.get("num_attention_heads").cloned() {
+                obj.insert("num_key_value_heads".to_string(), v);
+            }
+        }
+        if obj.get("head_dim").is_none() {
+            let hidden = obj.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(0);
+            let heads = obj
+                .get("num_attention_heads")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1);
+            if hidden > 0 && heads > 0 {
+                obj.insert(
+                    "head_dim".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(hidden / heads)),
+                );
+            }
+        }
+        if obj.get("rope_theta").is_none() {
+            obj.insert("rope_theta".to_string(), serde_json::json!(10000.0));
+        }
+        if obj.get("rms_norm_eps").is_none() {
+            obj.insert("rms_norm_eps".to_string(), serde_json::json!(1e-6));
+        }
+    }
+
+    let config: LlamaConfig = serde_json::from_value(config_value)?;
     Ok(config)
 }
 
@@ -395,5 +510,71 @@ mod tests {
         fs::write(dir.path().join("config.json"), br#"{"model_type":"phi3"}"#).expect("config");
         let arch = detect_model_arch(dir.path().join("config.json")).expect("detect arch");
         assert_eq!(arch, ModelArch::Phi3);
+    }
+
+    #[test]
+    fn detects_model_arch_from_architectures_array() {
+        let dir = TempDir::new("fermi-io-arch-array");
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{"architectures":["Qwen2ForCausalLM"]}"#,
+        )
+        .expect("config");
+        let arch = detect_model_arch(dir.path().join("config.json")).expect("detect arch");
+        assert_eq!(arch, ModelArch::Qwen);
+    }
+
+    #[test]
+    fn detects_llama_arch_from_model_type() {
+        let dir = TempDir::new("fermi-io-llama-arch");
+        fs::write(dir.path().join("config.json"), br#"{"model_type":"llama"}"#).expect("config");
+        let arch = detect_model_arch(dir.path().join("config.json")).expect("detect arch");
+        assert_eq!(arch, ModelArch::Llama);
+    }
+
+    #[test]
+    fn load_llama_config_backfills_missing_fields() {
+        let dir = TempDir::new("fermi-io-llama-config");
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{
+                "vocab_size": 32000,
+                "hidden_size": 4096,
+                "intermediate_size": 11008,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "max_position_embeddings": 4096
+            }"#,
+        )
+        .expect("config");
+
+        let cfg = load_llama_config(dir.path().join("config.json")).expect("load config");
+        assert_eq!(cfg.head_dim(), 128);
+        assert_eq!(cfg.num_key_value_heads, 32);
+        assert_eq!(cfg.rope_theta, 10000.0);
+        assert_eq!(cfg.rms_norm_eps, 1e-6);
+    }
+
+    #[test]
+    fn formats_hf_auth_errors_with_token_guidance() {
+        let msg = format_hf_download_error_message(
+            "meta-llama/Llama-3.2-1B",
+            "tokenizer.json",
+            "request error: status code 401",
+        );
+        assert!(msg.contains("Request access on Hugging Face first"));
+        assert!(msg.contains("export HF_TOKEN=hf_your_token_here"));
+        assert!(msg.contains("meta-llama/Llama-3.2-1B"));
+    }
+
+    #[test]
+    fn leaves_generic_hf_errors_unadorned() {
+        let msg = format_hf_download_error_message(
+            "Qwen/Qwen3-1.7B",
+            "config.json",
+            "dns lookup failed",
+        );
+        assert!(msg.contains("failed to download 'config.json'"));
+        assert!(!msg.contains("export HF_TOKEN=hf_your_token_here"));
     }
 }

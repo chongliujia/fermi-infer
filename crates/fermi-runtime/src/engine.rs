@@ -44,9 +44,115 @@ pub trait InferenceEngine: Send + Sync {
     fn append_tokens(&mut self, tokens: &[u32], offset: usize, device: &Device) -> Result<()>;
 }
 
-// =========================================================================
-// Original Qwen3Engine
-// =========================================================================
+trait DecoderModel {
+    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor>;
+}
+
+impl DecoderModel for Qwen3Model {
+    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        Ok(self.forward(input, offset)?)
+    }
+}
+
+impl DecoderModel for Phi3Model {
+    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        Ok(self.forward(input, offset)?)
+    }
+}
+
+fn append_tokens_for_model<M: DecoderModel>(
+    model: &mut M,
+    tokens: &[u32],
+    offset: usize,
+    device: &Device,
+) -> Result<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let input_tensor = Tensor::new(tokens, device)?.unsqueeze(0)?;
+    let _ = model.forward(&input_tensor, offset)?;
+    Ok(())
+}
+
+fn prefill_with_offset_for_model<M: DecoderModel>(
+    model: &mut M,
+    input_ids: &[u32],
+    offset: usize,
+    device: &Device,
+    cfg: &GenerationConfig,
+) -> Result<PrefillOutput> {
+    let input_tensor = Tensor::new(input_ids, device)?.unsqueeze(0)?;
+    let logits = model.forward(&input_tensor, offset)?;
+    let (_b, seq_len, _vocab) = logits.dims3()?;
+    let last_token_logits = logits.i((0, seq_len - 1, ..))?;
+
+    let mut generated_ids = Vec::new();
+    let mut rng = rand::thread_rng();
+    let next_token_id = sample_token(&last_token_logits, cfg, &generated_ids, &mut rng)?;
+    generated_ids.push(next_token_id);
+
+    Ok(PrefillOutput {
+        next_token_id,
+        generated_ids,
+        current_pos: offset + input_ids.len(),
+    })
+}
+
+fn decode_step_for_model<M: DecoderModel>(
+    model: &mut M,
+    token_id: u32,
+    current_pos: usize,
+    generated_ids: &[u32],
+    device: &Device,
+    cfg: &GenerationConfig,
+) -> Result<u32> {
+    let input_tensor = Tensor::new(&[token_id], device)?.unsqueeze(0)?;
+    let logits = model.forward(&input_tensor, current_pos)?;
+    let last_token_logits = logits.i((0, 0, ..))?;
+    let mut rng = rand::thread_rng();
+    sample_token(&last_token_logits, cfg, generated_ids, &mut rng)
+}
+
+fn generate_stream_with_offset_for_model<M: DecoderModel>(
+    model: &mut M,
+    input_ids: &[u32],
+    offset: usize,
+    device: &Device,
+    cfg: &GenerationConfig,
+    on_token: &mut dyn FnMut(u32) -> Result<bool>,
+) -> Result<Vec<u32>> {
+    if cfg.max_new_tokens == 0 {
+        return Ok(Vec::new());
+    }
+
+    let prefill = prefill_with_offset_for_model(model, input_ids, offset, device, cfg)?;
+    let mut next_token_id = prefill.next_token_id;
+    let mut generated_ids = prefill.generated_ids;
+    let mut current_pos = prefill.current_pos;
+    if !on_token(next_token_id)? {
+        return Ok(generated_ids);
+    }
+
+    if cfg.stop_tokens.contains(&next_token_id) {
+        return Ok(generated_ids);
+    }
+
+    for _ in 1..cfg.max_new_tokens {
+        next_token_id =
+            decode_step_for_model(model, next_token_id, current_pos, &generated_ids, device, cfg)?;
+        generated_ids.push(next_token_id);
+        if !on_token(next_token_id)? {
+            break;
+        }
+        if cfg.stop_tokens.contains(&next_token_id) {
+            break;
+        }
+        current_pos += 1;
+    }
+
+    Ok(generated_ids)
+}
+
 pub struct Qwen3Engine {
     model: Qwen3Model,
 }
@@ -63,7 +169,7 @@ impl InferenceEngine for Qwen3Engine {
         cfg: &GenerationConfig,
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
     ) -> Result<Vec<u32>> {
-        self.generate_stream_internal(input_ids, device, cfg, on_token)
+        generate_stream_with_offset_for_model(&mut self.model, input_ids, 0, device, cfg, on_token)
     }
 
     fn generate_stream_with_offset(
@@ -74,16 +180,18 @@ impl InferenceEngine for Qwen3Engine {
         cfg: &GenerationConfig,
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
     ) -> Result<Vec<u32>> {
-        self.generate_stream_with_offset_internal(input_ids, offset, device, cfg, on_token)
+        generate_stream_with_offset_for_model(
+            &mut self.model,
+            input_ids,
+            offset,
+            device,
+            cfg,
+            on_token,
+        )
     }
 
     fn append_tokens(&mut self, tokens: &[u32], offset: usize, device: &Device) -> Result<()> {
-        if tokens.is_empty() {
-            return Ok(());
-        }
-        let input_tensor = Tensor::new(tokens, device)?.unsqueeze(0)?;
-        let _ = self.model.forward(&input_tensor, offset)?;
-        Ok(())
+        append_tokens_for_model(&mut self.model, tokens, offset, device)
     }
 }
 
@@ -109,22 +217,7 @@ impl Qwen3Engine {
         device: &Device,
         cfg: &GenerationConfig,
     ) -> Result<PrefillOutput> {
-        let input_tensor = Tensor::new(input_ids, device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input_tensor, offset)?;
-        let (_b, seq_len, _vocab) = logits.dims3()?;
-        let last_token_logits = logits.i((0, seq_len - 1, ..))?;
-
-        let mut generated_ids = Vec::new();
-
-        let mut rng = rand::thread_rng();
-        let next_token_id = sample_token(&last_token_logits, cfg, &generated_ids, &mut rng)?;
-        generated_ids.push(next_token_id);
-
-        Ok(PrefillOutput {
-            next_token_id,
-            generated_ids,
-            current_pos: offset + input_ids.len(),
-        })
+        prefill_with_offset_for_model(&mut self.model, input_ids, offset, device, cfg)
     }
 
     pub fn decode_step(
@@ -135,104 +228,14 @@ impl Qwen3Engine {
         device: &Device,
         cfg: &GenerationConfig,
     ) -> Result<u32> {
-        let input_tensor = Tensor::new(&[token_id], device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input_tensor, current_pos)?;
-        let last_token_logits = logits.i((0, 0, ..))?;
-        let mut rng = rand::thread_rng();
-        sample_token(&last_token_logits, cfg, generated_ids, &mut rng)
-    }
-
-    // Renamed to internal to avoid conflict/confusion, though overloading isn't possible in Rust like this.
-    // Actually, keeping the name `generate_stream_internal` for the generic version is cleaner.
-    pub fn generate_stream_internal<F>(
-        &mut self,
-        input_ids: &[u32],
-        device: &Device,
-        cfg: &GenerationConfig,
-        mut on_token: F,
-    ) -> Result<Vec<u32>>
-    where
-        F: FnMut(u32) -> Result<bool>,
-    {
-        if cfg.max_new_tokens == 0 {
-            return Ok(Vec::new());
-        }
-
-        let prefill = self.prefill_with_offset(input_ids, 0, device, cfg)?;
-        let mut next_token_id = prefill.next_token_id;
-        let mut generated_ids = prefill.generated_ids;
-        let mut current_pos = prefill.current_pos;
-        if !on_token(next_token_id)? {
-            return Ok(generated_ids);
-        }
-
-        if cfg.stop_tokens.contains(&next_token_id) {
-            return Ok(generated_ids);
-        }
-
-        // Prefill already produced the first token, so decode at most N-1 more.
-        for _ in 1..cfg.max_new_tokens {
-            next_token_id =
-                self.decode_step(next_token_id, current_pos, &generated_ids, device, cfg)?;
-            generated_ids.push(next_token_id);
-            if !on_token(next_token_id)? {
-                break;
-            }
-
-            if cfg.stop_tokens.contains(&next_token_id) {
-                break;
-            }
-
-            current_pos += 1;
-        }
-
-        Ok(generated_ids)
-    }
-
-    pub fn generate_stream_with_offset_internal<F>(
-        &mut self,
-        input_ids: &[u32],
-        offset: usize,
-        device: &Device,
-        cfg: &GenerationConfig,
-        mut on_token: F,
-    ) -> Result<Vec<u32>>
-    where
-        F: FnMut(u32) -> Result<bool>,
-    {
-        if cfg.max_new_tokens == 0 {
-            return Ok(Vec::new());
-        }
-
-        let prefill = self.prefill_with_offset(input_ids, offset, device, cfg)?;
-        let mut next_token_id = prefill.next_token_id;
-        let mut generated_ids = prefill.generated_ids;
-        let mut current_pos = prefill.current_pos;
-        if !on_token(next_token_id)? {
-            return Ok(generated_ids);
-        }
-
-        if cfg.stop_tokens.contains(&next_token_id) {
-            return Ok(generated_ids);
-        }
-
-        // Prefill already produced the first token, so decode at most N-1 more.
-        for _ in 1..cfg.max_new_tokens {
-            next_token_id =
-                self.decode_step(next_token_id, current_pos, &generated_ids, device, cfg)?;
-            generated_ids.push(next_token_id);
-            if !on_token(next_token_id)? {
-                break;
-            }
-
-            if cfg.stop_tokens.contains(&next_token_id) {
-                break;
-            }
-
-            current_pos += 1;
-        }
-
-        Ok(generated_ids)
+        decode_step_for_model(
+            &mut self.model,
+            token_id,
+            current_pos,
+            generated_ids,
+            device,
+            cfg,
+        )
     }
 
     pub fn generate_stream_with_offset<F>(
@@ -246,48 +249,18 @@ impl Qwen3Engine {
     where
         F: FnMut(u32) -> Result<bool>,
     {
-        if cfg.max_new_tokens == 0 {
-            return Ok(Vec::new());
-        }
-
-        let prefill = self.prefill_with_offset(input_ids, offset, device, cfg)?;
-        let mut next_token_id = prefill.next_token_id;
-        let mut generated_ids = prefill.generated_ids;
-        let mut current_pos = prefill.current_pos;
-        if !on_token(next_token_id)? {
-            return Ok(generated_ids);
-        }
-
-        if cfg.stop_tokens.contains(&next_token_id) {
-            return Ok(generated_ids);
-        }
-
-        // Prefill already produced the first token, so decode at most N-1 more.
-        for _ in 1..cfg.max_new_tokens {
-            next_token_id =
-                self.decode_step(next_token_id, current_pos, &generated_ids, device, cfg)?;
-            generated_ids.push(next_token_id);
-            if !on_token(next_token_id)? {
-                break;
-            }
-
-            if cfg.stop_tokens.contains(&next_token_id) {
-                break;
-            }
-
-            current_pos += 1;
-        }
-
-        Ok(generated_ids)
+        generate_stream_with_offset_for_model(
+            &mut self.model,
+            input_ids,
+            offset,
+            device,
+            cfg,
+            &mut on_token,
+        )
     }
 
     pub fn append_tokens(&mut self, tokens: &[u32], offset: usize, device: &Device) -> Result<()> {
-        if tokens.is_empty() {
-            return Ok(());
-        }
-        let input_tensor = Tensor::new(tokens, device)?.unsqueeze(0)?;
-        let _ = self.model.forward(&input_tensor, offset)?;
-        Ok(())
+        append_tokens_for_model(&mut self.model, tokens, offset, device)
     }
 
     pub fn generate_stream_with_session<F, S: SessionStore>(
@@ -297,13 +270,14 @@ impl Qwen3Engine {
         input_ids: &[u32],
         device: &Device,
         cfg: &GenerationConfig,
-        on_token: F,
+        mut on_token: F,
     ) -> Result<Vec<u32>>
     where
         F: FnMut(u32) -> Result<bool>,
     {
         let _state = session_store.get_or_create(session_id.clone());
-        let out = self.generate_stream_internal(input_ids, device, cfg, on_token)?;
+        let out =
+            generate_stream_with_offset_for_model(&mut self.model, input_ids, 0, device, cfg, &mut on_token)?;
         session_store.touch(&session_id);
         Ok(out)
     }
@@ -325,7 +299,7 @@ impl InferenceEngine for Phi3Engine {
         cfg: &GenerationConfig,
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
     ) -> Result<Vec<u32>> {
-        self.generate_stream_internal(input_ids, device, cfg, on_token)
+        generate_stream_with_offset_for_model(&mut self.model, input_ids, 0, device, cfg, on_token)
     }
 
     fn generate_stream_with_offset(
@@ -336,16 +310,18 @@ impl InferenceEngine for Phi3Engine {
         cfg: &GenerationConfig,
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
     ) -> Result<Vec<u32>> {
-        self.generate_stream_with_offset_internal(input_ids, offset, device, cfg, on_token)
+        generate_stream_with_offset_for_model(
+            &mut self.model,
+            input_ids,
+            offset,
+            device,
+            cfg,
+            on_token,
+        )
     }
 
     fn append_tokens(&mut self, tokens: &[u32], offset: usize, device: &Device) -> Result<()> {
-        if tokens.is_empty() {
-            return Ok(());
-        }
-        let input_tensor = Tensor::new(tokens, device)?.unsqueeze(0)?;
-        let _ = self.model.forward(&input_tensor, offset)?;
-        Ok(())
+        append_tokens_for_model(&mut self.model, tokens, offset, device)
     }
 }
 
@@ -353,128 +329,6 @@ impl Phi3Engine {
     pub fn new(config: &Phi3Config, vb: VarBuilder) -> Result<Self> {
         let model = Phi3Model::new(config, vb)?;
         Ok(Self { model })
-    }
-
-    fn prefill_with_offset(
-        &mut self,
-        input_ids: &[u32],
-        offset: usize,
-        device: &Device,
-        cfg: &GenerationConfig,
-    ) -> Result<PrefillOutput> {
-        let input_tensor = Tensor::new(input_ids, device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input_tensor, offset)?;
-        let (_b, seq_len, _vocab) = logits.dims3()?;
-        let last_token_logits = logits.i((0, seq_len - 1, ..))?;
-
-        let mut generated_ids = Vec::new();
-        let mut rng = rand::thread_rng();
-        let next_token_id = sample_token(&last_token_logits, cfg, &generated_ids, &mut rng)?;
-        generated_ids.push(next_token_id);
-
-        Ok(PrefillOutput {
-            next_token_id,
-            generated_ids,
-            current_pos: offset + input_ids.len(),
-        })
-    }
-
-    fn decode_step(
-        &mut self,
-        token_id: u32,
-        current_pos: usize,
-        generated_ids: &[u32],
-        device: &Device,
-        cfg: &GenerationConfig,
-    ) -> Result<u32> {
-        let input_tensor = Tensor::new(&[token_id], device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input_tensor, current_pos)?;
-        let last_token_logits = logits.i((0, 0, ..))?;
-        let mut rng = rand::thread_rng();
-        sample_token(&last_token_logits, cfg, generated_ids, &mut rng)
-    }
-
-    fn generate_stream_internal<F>(
-        &mut self,
-        input_ids: &[u32],
-        device: &Device,
-        cfg: &GenerationConfig,
-        mut on_token: F,
-    ) -> Result<Vec<u32>>
-    where
-        F: FnMut(u32) -> Result<bool>,
-    {
-        if cfg.max_new_tokens == 0 {
-            return Ok(Vec::new());
-        }
-
-        let prefill = self.prefill_with_offset(input_ids, 0, device, cfg)?;
-        let mut next_token_id = prefill.next_token_id;
-        let mut generated_ids = prefill.generated_ids;
-        let mut current_pos = prefill.current_pos;
-        if !on_token(next_token_id)? {
-            return Ok(generated_ids);
-        }
-
-        if cfg.stop_tokens.contains(&next_token_id) {
-            return Ok(generated_ids);
-        }
-
-        for _ in 1..cfg.max_new_tokens {
-            next_token_id =
-                self.decode_step(next_token_id, current_pos, &generated_ids, device, cfg)?;
-            generated_ids.push(next_token_id);
-            if !on_token(next_token_id)? {
-                break;
-            }
-            if cfg.stop_tokens.contains(&next_token_id) {
-                break;
-            }
-            current_pos += 1;
-        }
-        Ok(generated_ids)
-    }
-
-    fn generate_stream_with_offset_internal<F>(
-        &mut self,
-        input_ids: &[u32],
-        offset: usize,
-        device: &Device,
-        cfg: &GenerationConfig,
-        mut on_token: F,
-    ) -> Result<Vec<u32>>
-    where
-        F: FnMut(u32) -> Result<bool>,
-    {
-        if cfg.max_new_tokens == 0 {
-            return Ok(Vec::new());
-        }
-
-        let prefill = self.prefill_with_offset(input_ids, offset, device, cfg)?;
-        let mut next_token_id = prefill.next_token_id;
-        let mut generated_ids = prefill.generated_ids;
-        let mut current_pos = prefill.current_pos;
-        if !on_token(next_token_id)? {
-            return Ok(generated_ids);
-        }
-
-        if cfg.stop_tokens.contains(&next_token_id) {
-            return Ok(generated_ids);
-        }
-
-        for _ in 1..cfg.max_new_tokens {
-            next_token_id =
-                self.decode_step(next_token_id, current_pos, &generated_ids, device, cfg)?;
-            generated_ids.push(next_token_id);
-            if !on_token(next_token_id)? {
-                break;
-            }
-            if cfg.stop_tokens.contains(&next_token_id) {
-                break;
-            }
-            current_pos += 1;
-        }
-        Ok(generated_ids)
     }
 }
 

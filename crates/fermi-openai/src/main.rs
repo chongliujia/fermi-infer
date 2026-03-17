@@ -1,12 +1,13 @@
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result as AnyResult;
 use axum::{
     Json, Router,
     extract::State,
+    http::header,
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -18,10 +19,12 @@ use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Bearer;
 use candle_core::Device;
-use fermi_io::load_tokenizer;
+use fermi_io::{ModelArch, load_tokenizer};
+use fermi_metrics::Metrics;
 use fermi_runtime::{
-    GenerationConfig, InferenceEngine, ModelBuilder, SamplingDefaults, load_config,
-    resolve_sampling_params, sampling_defaults_from_sources,
+    GenerationConfig, InferenceEngine, ModelBuilder, PromptMessage, SamplingDefaults,
+    build_stop_tokens, load_config, render_messages_prompt, resolve_sampling_params,
+    sampling_defaults_from_sources,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,6 +43,7 @@ struct AppState {
     tokenizer: Arc<Tokenizer>,
     device: Device,
     stop_tokens: Vec<u32>,
+    model_arch: ModelArch,
     model_id: String,
     max_position_embeddings: usize,
     default_system_prompt: Option<String>,
@@ -47,6 +51,7 @@ struct AppState {
     default_thinking: ThinkingMode,
     supports_thinking_override: Option<bool>,
     sampling_defaults: SamplingDefaults,
+    metrics: Arc<Metrics>,
 }
 
 #[derive(Deserialize)]
@@ -236,7 +241,8 @@ async fn main() -> AnyResult<()> {
     }
 
     let tokenizer = Arc::new(load_tokenizer(builder.tokenizer_path())?);
-    let stop_tokens = build_stop_tokens(tokenizer.as_ref());
+    let model_arch = builder.model_arch();
+    let stop_tokens = build_stop_tokens(model_arch, tokenizer.as_ref());
     let semaphore = Arc::new(Semaphore::new(pool_size));
 
     let state = AppState {
@@ -246,6 +252,7 @@ async fn main() -> AnyResult<()> {
         tokenizer,
         device,
         stop_tokens,
+        model_arch,
         model_id: model_id.clone(),
         max_position_embeddings: builder.max_position_embeddings(),
         default_system_prompt,
@@ -253,6 +260,7 @@ async fn main() -> AnyResult<()> {
         default_thinking,
         supports_thinking_override,
         sampling_defaults,
+        metrics: Arc::new(Metrics::new()),
     };
 
     let addr = std::env::var("FERMI_OPENAI_ADDR")
@@ -263,6 +271,7 @@ async fn main() -> AnyResult<()> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/models", get(list_models))
+        .route("/metrics", get(metrics))
         .with_state(Arc::new(state));
 
     info!("openai-like server listening on {}", addr);
@@ -284,16 +293,25 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (StatusCode::OK, Json(body))
 }
 
+async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        state.metrics.render_prometheus(),
+    )
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     auth: Option<TypedHeader<Authorization<Bearer>>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    state.metrics.record_request();
     if auth.is_none() {
         warn!("missing Authorization header");
     }
     if req.messages.is_empty() {
-        return openai_error(
+        return state_openai_error(
+            &state,
             StatusCode::BAD_REQUEST,
             "messages must not be empty",
             "invalid_request_error",
@@ -302,7 +320,14 @@ async fn chat_completions(
 
     let model_id = match resolve_model(req.model.as_deref(), &state.model_id) {
         Ok(model) => model,
-        Err(msg) => return openai_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+        Err(msg) => {
+            return state_openai_error(
+                &state,
+                StatusCode::BAD_REQUEST,
+                msg,
+                "invalid_request_error",
+            )
+        }
     };
 
     let stream = req.stream.unwrap_or(false);
@@ -320,7 +345,8 @@ async fn chat_completions(
     ) {
         Ok(v) => v,
         Err(err) => {
-            return openai_error(
+            return state_openai_error(
+                &state,
                 StatusCode::BAD_REQUEST,
                 err.to_string(),
                 "invalid_request_error",
@@ -345,6 +371,7 @@ async fn chat_completions(
     }
 
     let prompt = build_prompt(
+        state.model_arch,
         &req.messages,
         think_mode,
         state.default_system_prompt.as_deref(),
@@ -352,7 +379,8 @@ async fn chat_completions(
     let prompt_tokens = match state.tokenizer.encode(prompt.clone(), false) {
         Ok(tokens) => tokens.get_ids().len(),
         Err(err) => {
-            return openai_error(
+            return state_openai_error(
+                &state,
                 StatusCode::BAD_REQUEST,
                 err.to_string(),
                 "invalid_request_error",
@@ -365,7 +393,7 @@ async fn chat_completions(
             "prompt too long: {} tokens (limit {})",
             prompt_tokens, state.max_position_embeddings
         );
-        return openai_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error");
+        return state_openai_error(&state, StatusCode::BAD_REQUEST, msg, "invalid_request_error");
     }
 
     let gen_cfg = GenerationConfig {
@@ -383,7 +411,8 @@ async fn chat_completions(
     let reply = match run_inference(state.clone(), prompt, gen_cfg).await {
         Ok(r) => r,
         Err(err) => {
-            return openai_error(
+            return state_openai_error(
+                &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 err.to_string(),
                 "server_error",
@@ -420,13 +449,21 @@ async fn responses(
     auth: Option<TypedHeader<Authorization<Bearer>>>,
     Json(req): Json<ResponsesRequest>,
 ) -> Response {
+    state.metrics.record_request();
     if auth.is_none() {
         warn!("missing Authorization header");
     }
 
     let model_id = match resolve_model(req.model.as_deref(), &state.model_id) {
         Ok(model) => model,
-        Err(msg) => return openai_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+        Err(msg) => {
+            return state_openai_error(
+                &state,
+                StatusCode::BAD_REQUEST,
+                msg,
+                "invalid_request_error",
+            )
+        }
     };
 
     let stream = req.stream.unwrap_or(false);
@@ -440,7 +477,8 @@ async fn responses(
     ) {
         Ok(v) => v,
         Err(err) => {
-            return openai_error(
+            return state_openai_error(
+                &state,
                 StatusCode::BAD_REQUEST,
                 err.to_string(),
                 "invalid_request_error",
@@ -450,9 +488,17 @@ async fn responses(
 
     let messages = match normalize_responses_input(&req.input, req.instructions.as_deref()) {
         Ok(m) => m,
-        Err(err) => return openai_error(StatusCode::BAD_REQUEST, err, "invalid_request_error"),
+        Err(err) => {
+            return state_openai_error(
+                &state,
+                StatusCode::BAD_REQUEST,
+                err,
+                "invalid_request_error",
+            )
+        }
     };
     let prompt = build_prompt(
+        state.model_arch,
         &messages,
         ThinkingMode::Off,
         state.default_system_prompt.as_deref(),
@@ -461,7 +507,8 @@ async fn responses(
     let prompt_tokens = match state.tokenizer.encode(prompt.clone(), false) {
         Ok(tokens) => tokens.get_ids().len(),
         Err(err) => {
-            return openai_error(
+            return state_openai_error(
+                &state,
                 StatusCode::BAD_REQUEST,
                 err.to_string(),
                 "invalid_request_error",
@@ -473,7 +520,7 @@ async fn responses(
             "prompt too long: {} tokens (limit {})",
             prompt_tokens, state.max_position_embeddings
         );
-        return openai_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error");
+        return state_openai_error(&state, StatusCode::BAD_REQUEST, msg, "invalid_request_error");
     }
 
     let gen_cfg = GenerationConfig {
@@ -491,7 +538,8 @@ async fn responses(
     let reply = match run_inference(state.clone(), prompt, gen_cfg).await {
         Ok(r) => r,
         Err(err) => {
-            return openai_error(
+            return state_openai_error(
+                &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 err.to_string(),
                 "server_error",
@@ -535,31 +583,54 @@ async fn run_inference(
     prompt: String,
     cfg: GenerationConfig,
 ) -> AnyResult<InferenceResult> {
+    let queue_start = Instant::now();
     let permit = state.semaphore.clone().acquire_owned().await?;
+    state.metrics.observe_queue_wait(queue_start.elapsed());
     let engine = next_engine(&state);
     let tokenizer = state.tokenizer.clone();
     let device = state.device.clone();
+    let metrics = Arc::clone(&state.metrics);
+    let active = metrics.track_active_request();
 
     let result = tokio::task::spawn_blocking(move || -> AnyResult<InferenceResult> {
         let _permit = permit;
+        let _active = active;
         let mut engine = engine.lock().expect("engine mutex poisoned");
         engine.clear_kv_cache();
+        let generation_start = Instant::now();
+        let mut ttft = None;
         let tokens = tokenizer
             .encode(prompt, false)
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|err| {
+                metrics.record_error();
+                anyhow::Error::msg(err)
+            })?;
         let input_ids = tokens.get_ids().to_vec();
 
         let mut utf8 = Utf8Buffer::new();
         let mut out = String::new();
-        let generated = engine.generate_stream(&input_ids, &device, &cfg, &mut |token_id| {
+        let generated = match engine.generate_stream(&input_ids, &device, &cfg, &mut |token_id| {
+            if ttft.is_none() {
+                ttft = Some(generation_start.elapsed());
+            }
             if let Some(text) = utf8.push_and_decode(token_id, &tokenizer)? {
                 out.push_str(&text);
             }
             Ok(true)
-        })?;
+        }) {
+            Ok(generated) => generated,
+            Err(err) => {
+                metrics.record_error();
+                return Err(err.into());
+            }
+        };
         if let Some(tail) = utf8.flush(&tokenizer)? {
             out.push_str(&tail);
         }
+        if let Some(duration) = ttft {
+            metrics.observe_ttft(duration);
+        }
+        metrics.observe_generation(generated.len(), generation_start.elapsed());
 
         let finish_reason = finish_reason_for_generation(&generated, &cfg);
 
@@ -575,28 +646,36 @@ async fn run_inference(
 }
 
 async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig) -> Response {
+    let queue_start = Instant::now();
     let permit = match state.semaphore.clone().acquire_owned().await {
         Ok(p) => p,
         Err(err) => {
-            return openai_error(
+            return state_openai_error(
+                &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 err.to_string(),
                 "server_error",
             );
         }
     };
+    state.metrics.observe_queue_wait(queue_start.elapsed());
     let engine = next_engine(&state);
     let tokenizer = state.tokenizer.clone();
     let device = state.device.clone();
     let model = state.model_id.clone();
     let created = unix_ts();
+    let metrics = Arc::clone(&state.metrics);
+    let active = metrics.track_active_request();
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _active = active;
         let mut engine = engine.lock().expect("engine mutex poisoned");
         engine.clear_kv_cache();
+        let generation_start = Instant::now();
+        let mut ttft = None;
 
         let id = format!("chatcmpl-{}", Uuid::new_v4());
         let start_evt = json!({
@@ -611,6 +690,7 @@ async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig
         let tokens = match tokenizer.encode(prompt, false) {
             Ok(t) => t,
             Err(err) => {
+                metrics.record_error();
                 let _ = tx.blocking_send(Ok(Event::default().data(openai_error_payload(
                     err.to_string(),
                     "invalid_request_error",
@@ -623,6 +703,9 @@ async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig
         let mut utf8 = Utf8Buffer::new();
 
         let result = engine.generate_stream(&input_ids, &device, &cfg, &mut |token_id| {
+            if ttft.is_none() {
+                ttft = Some(generation_start.elapsed());
+            }
             if let Some(text) = utf8.push_and_decode(token_id, &tokenizer)? {
                 let chunk = json!({
                     "id": id,
@@ -648,10 +731,19 @@ async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig
                 let _ = tx.blocking_send(Ok(Event::default().data(chunk.to_string())));
             }
         }
+        if let Some(duration) = ttft {
+            metrics.observe_ttft(duration);
+        }
 
         let finish_reason = match &result {
-            Ok(generated) => finish_reason_for_generation(generated, &cfg),
-            Err(_) => "error".to_string(),
+            Ok(generated) => {
+                metrics.observe_generation(generated.len(), generation_start.elapsed());
+                finish_reason_for_generation(generated, &cfg)
+            }
+            Err(_) => {
+                metrics.record_error();
+                "error".to_string()
+            }
         };
         let end_evt = json!({
             "id": id,
@@ -671,28 +763,36 @@ async fn stream_chat(state: Arc<AppState>, prompt: String, cfg: GenerationConfig
 }
 
 async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationConfig) -> Response {
+    let queue_start = Instant::now();
     let permit = match state.semaphore.clone().acquire_owned().await {
         Ok(p) => p,
         Err(err) => {
-            return openai_error(
+            return state_openai_error(
+                &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 err.to_string(),
                 "server_error",
             );
         }
     };
+    state.metrics.observe_queue_wait(queue_start.elapsed());
     let engine = next_engine(&state);
     let tokenizer = state.tokenizer.clone();
     let device = state.device.clone();
     let model = state.model_id.clone();
     let created = unix_ts();
+    let metrics = Arc::clone(&state.metrics);
+    let active = metrics.track_active_request();
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _active = active;
         let mut engine = engine.lock().expect("engine mutex poisoned");
         engine.clear_kv_cache();
+        let generation_start = Instant::now();
+        let mut ttft = None;
 
         let id = format!("resp-{}", Uuid::new_v4());
         let start_evt = json!({
@@ -707,6 +807,7 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
         let tokens = match tokenizer.encode(prompt, false) {
             Ok(t) => t,
             Err(err) => {
+                metrics.record_error();
                 let _ = tx.blocking_send(Ok(Event::default().data(openai_error_payload(
                     err.to_string(),
                     "invalid_request_error",
@@ -719,6 +820,9 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
         let mut utf8 = Utf8Buffer::new();
 
         let result = engine.generate_stream(&input_ids, &device, &cfg, &mut |token_id| {
+            if ttft.is_none() {
+                ttft = Some(generation_start.elapsed());
+            }
             if let Some(text) = utf8.push_and_decode(token_id, &tokenizer)? {
                 let chunk = json!({
                     "id": id,
@@ -746,9 +850,13 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
                 let _ = tx.blocking_send(Ok(Event::default().data(chunk.to_string())));
             }
         }
+        if let Some(duration) = ttft {
+            metrics.observe_ttft(duration);
+        }
 
         let finish_type = match &result {
             Ok(generated) => {
+                metrics.observe_generation(generated.len(), generation_start.elapsed());
                 let reason = finish_reason_for_generation(generated, &cfg);
                 if reason == "length" {
                     "response.incomplete"
@@ -756,7 +864,10 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
                     "response.completed"
                 }
             }
-            Err(_) => "response.failed",
+            Err(_) => {
+                metrics.record_error();
+                "response.failed"
+            }
         };
         let end_evt = json!({
             "id": id,
@@ -776,65 +887,35 @@ async fn stream_responses(state: Arc<AppState>, prompt: String, cfg: GenerationC
 }
 
 fn build_prompt(
+    model_arch: ModelArch,
     messages: &[ChatMessage],
     think_mode: ThinkingMode,
     default_system_prompt: Option<&str>,
 ) -> String {
-    let mut out = String::new();
-    let has_explicit_system = messages
+    let normalized_messages: Vec<_> = messages
         .iter()
-        .any(|msg| matches!(msg.role.as_str(), "system" | "developer"));
-    if !has_explicit_system && let Some(sys) = default_system_prompt {
-        let sys = sys.trim();
-        if !sys.is_empty() {
-            out.push_str("<|im_start|>system\n");
-            out.push_str(sys);
-            out.push_str("<|im_end|>\n");
-        }
-    }
-
-    for msg in messages {
-        let role = msg.role.as_str();
-        let content = match extract_content(&msg.content) {
-            Some(c) => c,
-            None => continue,
-        };
-        match role {
-            "system" | "developer" => {
-                out.push_str("<|im_start|>system\n");
-                out.push_str(&content);
-                out.push_str("<|im_end|>\n");
-            }
-            "user" => {
-                out.push_str("<|im_start|>user\n");
-                out.push_str(&content);
-                out.push_str("<|im_end|>\n");
-            }
-            "assistant" => {
-                out.push_str("<|im_start|>assistant\n");
-                out.push_str(&content);
-                out.push_str("<|im_end|>\n");
-            }
-            _ => {}
-        }
-    }
-
-    match think_mode {
-        ThinkingMode::Off => {
-            out.push_str("<|im_start|>system\n");
-            out.push_str("请直接给出最终答案，不输出思考过程，也不要输出<think>标签。\n");
-            out.push_str("<|im_end|>\n");
-        }
-        ThinkingMode::On => {
-            out.push_str("<|im_start|>system\n");
-            out.push_str("请将思考过程放在<think>...</think>中，最终答案放在think之外。\n");
-            out.push_str("<|im_end|>\n");
-        }
-        ThinkingMode::Auto => {}
-    }
-
-    out.push_str("<|im_start|>assistant\n");
-    out
+        .filter_map(|msg| {
+            extract_content(&msg.content).map(|content| (msg.role.as_str(), content))
+        })
+        .collect();
+    let prompt_messages: Vec<_> = normalized_messages
+        .iter()
+        .map(|(role, content)| PromptMessage {
+            role,
+            content: content.as_str(),
+        })
+        .collect();
+    let extra_system_prompt = match think_mode {
+        ThinkingMode::Off => Some("请直接给出最终答案，不输出思考过程，也不要输出<think>标签。"),
+        ThinkingMode::On => Some("请将思考过程放在<think>...</think>中，最终答案放在think之外。"),
+        ThinkingMode::Auto => None,
+    };
+    render_messages_prompt(
+        model_arch,
+        &prompt_messages,
+        default_system_prompt,
+        extra_system_prompt,
+    )
 }
 
 fn normalize_responses_input(
@@ -907,17 +988,6 @@ fn extract_content(value: &serde_json::Value) -> Option<String> {
 fn next_engine(state: &AppState) -> Arc<Mutex<Box<dyn InferenceEngine>>> {
     let idx = state.next_engine.fetch_add(1, Ordering::Relaxed) % state.engines.len();
     Arc::clone(&state.engines[idx])
-}
-
-fn build_stop_tokens(tokenizer: &Tokenizer) -> Vec<u32> {
-    let mut stop_tokens = Vec::new();
-    if let Some(eos) = tokenizer.token_to_id("<|endoftext|>") {
-        stop_tokens.push(eos);
-    }
-    if let Some(im_end) = tokenizer.token_to_id("<|im_end|>") {
-        stop_tokens.push(im_end);
-    }
-    stop_tokens
 }
 
 fn device_setup() -> AnyResult<Device> {
@@ -994,6 +1064,16 @@ fn openai_error(status: StatusCode, message: impl Into<String>, error_type: &str
         },
     };
     (status, Json(body)).into_response()
+}
+
+fn state_openai_error(
+    state: &AppState,
+    status: StatusCode,
+    message: impl Into<String>,
+    error_type: &str,
+) -> Response {
+    state.metrics.record_error();
+    openai_error(status, message, error_type)
 }
 
 fn openai_error_payload(message: impl Into<String>, error_type: &str) -> String {

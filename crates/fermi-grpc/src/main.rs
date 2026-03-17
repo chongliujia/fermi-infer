@@ -4,17 +4,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Error as E, Result as AnyResult};
+use axum::{Router, extract::State, http::header, response::IntoResponse, routing::get};
 use candle_core::Device;
 use fermi_grpc::fermi::fermi_server::{Fermi, FermiServer};
 use fermi_grpc::fermi::{GenerateRequest, GenerateResponse};
-use fermi_io::load_tokenizer;
+use fermi_io::{ModelArch, load_tokenizer};
+use fermi_metrics::Metrics;
 use fermi_runtime::{
     GenerationConfig, InMemorySessionStore, InferenceEngine, ModelBuilder, SamplingDefaults,
-    SessionId, SessionStore, load_config, resolve_sampling_params, sampling_defaults_from_sources,
+    SessionId, SessionStore, assistant_turn_end_token_id, build_stop_tokens, load_config,
+    render_history_prompt, render_user_chunk, resolve_sampling_params,
+    sampling_defaults_from_sources,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use tracing::{error, info};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -23,12 +28,14 @@ struct FermiService {
     engine_owner: Arc<Mutex<Vec<Option<SessionId>>>>,
     device: Device,
     tokenizer: Arc<tokenizers::Tokenizer>,
+    model_arch: ModelArch,
     sessions: Arc<InMemorySessionStore>,
     max_position_embeddings: usize,
     timeout_ms: u64,
     sampling_defaults: SamplingDefaults,
     default_system_prompt: Option<String>,
     disable_think: bool,
+    metrics: Arc<Metrics>,
 }
 
 fn release_session_binding(
@@ -69,6 +76,7 @@ impl FermiService {
         engine_pool: Vec<Arc<Mutex<Box<dyn InferenceEngine>>>>,
         device: Device,
         tokenizer: tokenizers::Tokenizer,
+        model_arch: ModelArch,
         max_position_embeddings: usize,
         timeout_ms: u64,
         sampling_defaults: SamplingDefaults,
@@ -76,6 +84,7 @@ impl FermiService {
         session_max: Option<usize>,
         default_system_prompt: Option<String>,
         disable_think: bool,
+        metrics: Arc<Metrics>,
     ) -> Self {
         let engine_owner = vec![None; engine_pool.len()];
         Self {
@@ -83,6 +92,7 @@ impl FermiService {
             engine_owner: Arc::new(Mutex::new(engine_owner)),
             device,
             tokenizer: Arc::new(tokenizer),
+            model_arch,
             sessions: Arc::new(InMemorySessionStore::new_with_limits(
                 session_ttl_ms.map(Duration::from_millis),
                 session_max,
@@ -92,18 +102,11 @@ impl FermiService {
             sampling_defaults,
             default_system_prompt,
             disable_think,
+            metrics,
         }
     }
 
     fn build_gen_config(&self, req: &GenerateRequest) -> Result<GenerationConfig, Status> {
-        let mut stop_tokens = Vec::new();
-        if let Some(eos) = self.tokenizer.token_to_id("<|endoftext|>") {
-            stop_tokens.push(eos);
-        }
-        if let Some(im_end) = self.tokenizer.token_to_id("<|im_end|>") {
-            stop_tokens.push(im_end);
-        }
-
         let requested_max_new_tokens = if req.max_new_tokens == 0 {
             None
         } else {
@@ -139,7 +142,7 @@ impl FermiService {
         Ok(GenerationConfig {
             max_new_tokens: sampling.max_new_tokens,
             repeat_penalty: sampling.repeat_penalty,
-            stop_tokens,
+            stop_tokens: build_stop_tokens(self.model_arch, &self.tokenizer),
             temperature: sampling.temperature,
             top_p: sampling.top_p,
         })
@@ -209,50 +212,8 @@ fn build_effective_system_prompt(
     sys
 }
 
-fn render_history_prompt(
-    pairs: &[(String, String)],
-    user_text: &str,
-    system_prompt: Option<&str>,
-) -> String {
-    let mut out = String::new();
-    if let Some(sys) = system_prompt {
-        if !sys.is_empty() {
-            out.push_str("<|im_start|>system\n");
-            out.push_str(sys);
-            out.push_str("<|im_end|>\n");
-        }
-    }
-    for (user, assistant) in pairs {
-        out.push_str("<|im_start|>user\n");
-        out.push_str(user);
-        out.push_str("<|im_end|>\n<|im_start|>assistant\n");
-        out.push_str(assistant);
-        out.push_str("<|im_end|>\n");
-    }
-    out.push_str("<|im_start|>user\n");
-    out.push_str(user_text);
-    out.push_str("<|im_end|>\n<|im_start|>assistant\n");
-    out
-}
-
-fn render_user_chunk(user_text: &str, has_context: bool, system_prompt: Option<&str>) -> String {
-    let mut out = String::new();
-    if has_context {
-        out.push('\n');
-    } else if let Some(sys) = system_prompt {
-        if !sys.is_empty() {
-            out.push_str("<|im_start|>system\n");
-            out.push_str(sys);
-            out.push_str("<|im_end|>\n");
-        }
-    }
-    out.push_str("<|im_start|>user\n");
-    out.push_str(user_text);
-    out.push_str("<|im_end|>\n<|im_start|>assistant\n");
-    out
-}
-
 fn build_truncated_prompt(
+    model_arch: ModelArch,
     pairs: &[(String, String)],
     user_text: &str,
     system_prompt: Option<&str>,
@@ -263,7 +224,7 @@ fn build_truncated_prompt(
     let mut start = 0usize;
     loop {
         let kept = &pairs[start..];
-        let prompt = render_history_prompt(kept, user_text, system_prompt);
+        let prompt = render_history_prompt(model_arch, kept, user_text, system_prompt);
         let tokens = tokenizer
             .encode(prompt.clone(), false)
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -286,6 +247,7 @@ impl Fermi for FermiService {
         &self,
         request: Request<GenerateRequest>,
     ) -> std::result::Result<Response<Self::GenerateStream>, Status> {
+        self.metrics.record_request();
         struct InflightGuard {
             sessions: Arc<InMemorySessionStore>,
             session_id: SessionId,
@@ -307,8 +269,15 @@ impl Fermi for FermiService {
         } else {
             req.session_id.clone()
         };
-        let gen_cfg = self.build_gen_config(&req)?;
+        let gen_cfg = match self.build_gen_config(&req) {
+            Ok(cfg) => cfg,
+            Err(status) => {
+                self.metrics.record_error();
+                return Err(status);
+            }
+        };
         if !self.sessions.try_begin(&session_id) {
+            self.metrics.record_error();
             return Err(Status::resource_exhausted(
                 "session is busy; concurrent requests are not supported",
             ));
@@ -318,6 +287,7 @@ impl Fermi for FermiService {
             session_id: session_id.clone(),
             enabled: true,
         };
+        self.metrics.observe_queue_wait(Duration::ZERO);
         let state = self.sessions.get_or_create(session_id.clone());
         let mut history = state.history;
         let mut has_context = state.has_context;
@@ -331,12 +301,23 @@ impl Fermi for FermiService {
             history.clear();
             has_context = false;
         }
-        let (engine_id, fresh_engine) = self.get_engine_for_session(&session_id)?;
+        let (engine_id, fresh_engine) = match self.get_engine_for_session(&session_id) {
+            Ok(v) => v,
+            Err(status) => {
+                self.metrics.record_error();
+                return Err(status);
+            }
+        };
         let mut offset = if has_context { state.current_pos } else { 0 };
         let mut input_ids = self
             .tokenizer
             .encode(
-                render_user_chunk(&req.prompt, has_context, system_prompt.as_deref()),
+                render_user_chunk(
+                    self.model_arch,
+                    &req.prompt,
+                    has_context,
+                    system_prompt.as_deref(),
+                ),
                 false,
             )
             .map_err(|e| Status::internal(e.to_string()))?
@@ -347,6 +328,7 @@ impl Fermi for FermiService {
         let expected_max = offset + input_ids.len() + gen_cfg.max_new_tokens + 8;
         if expected_max > self.max_position_embeddings || rebuild_cache {
             let (trunc_ids, kept_pairs) = build_truncated_prompt(
+                self.model_arch,
                 &history,
                 &req.prompt,
                 system_prompt.as_deref(),
@@ -362,6 +344,7 @@ impl Fermi for FermiService {
                     }
                     self.sessions.release(&session_id);
                 }
+                self.metrics.record_error();
                 return Err(Status::invalid_argument(format!(
                     "prompt too long: {} tokens (limit {})",
                     trunc_ids.len(),
@@ -385,6 +368,7 @@ impl Fermi for FermiService {
                 }
                 self.sessions.release(&session_id);
             }
+            self.metrics.record_error();
             return Err(Status::invalid_argument(format!(
                 "prompt too long: {} tokens (limit {})",
                 input_ids.len(),
@@ -402,13 +386,14 @@ impl Fermi for FermiService {
         let prompt_user = req.prompt.clone();
         let offset_for_cache = offset;
         let input_len = input_ids.len();
-        let im_end_id = tokenizer.token_to_id("<|im_end|>");
+        let turn_end_id = assistant_turn_end_token_id(self.model_arch, &tokenizer);
         let system_prompt_used = system_prompt.clone();
         let mut recent_tokens: Vec<u32> = Vec::with_capacity(12);
         let mut loop_triggered = false;
         let mut timeout_triggered = false;
         let timeout_ms = self.timeout_ms;
         let keep_session = !ephemeral_session;
+        let metrics = Arc::clone(&self.metrics);
 
         tokio::task::spawn_blocking(move || {
             struct SessionGuard {
@@ -425,9 +410,11 @@ impl Fermi for FermiService {
                 sessions: Arc::clone(&sessions),
                 session_id: session_id_clone.clone(),
             };
+            let _active = metrics.track_active_request();
             let mut engine = match engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
+                    metrics.record_error();
                     let _ = tx.blocking_send(Err(Status::internal("engine mutex poisoned")));
                     return;
                 }
@@ -438,12 +425,16 @@ impl Fermi for FermiService {
                 engine.clear_kv_cache();
             }
             let mut assistant_buf = String::new();
+            let mut ttft = None;
             let result = engine.generate_stream_with_offset(
                 &input_ids,
                 offset_for_cache,
                 &device,
                 &gen_cfg,
                 &mut |token_id| {
+                    if ttft.is_none() {
+                        ttft = Some(start_time.elapsed());
+                    }
                     if timeout_ms > 0 && start_time.elapsed().as_millis() as u64 >= timeout_ms {
                         timeout_triggered = true;
                         return Ok(false);
@@ -473,17 +464,24 @@ impl Fermi for FermiService {
                 engine.clear_kv_cache();
                 release_session_binding(&engine_owner, &sessions, &session_id_clone, engine_id);
             }
+            if let Some(duration) = ttft {
+                metrics.observe_ttft(duration);
+            }
 
             if timeout_triggered {
+                metrics.record_error();
                 let _ = tx.blocking_send(Err(Status::deadline_exceeded("generation timeout")));
             } else if loop_triggered {
+                metrics.record_error();
                 let _ = tx.blocking_send(Err(Status::aborted("repetitive output detected")));
             } else if let Err(err) = &result {
+                metrics.record_error();
                 engine.clear_kv_cache();
                 release_session_binding(&engine_owner, &sessions, &session_id_clone, engine_id);
                 let _ = tx.blocking_send(Err(Status::internal(err.to_string())));
             } else {
                 if let Ok(generated) = &result {
+                    metrics.observe_generation(generated.len(), start_time.elapsed());
                     let mut cache_len = offset_for_cache + input_len;
                     if !generated.is_empty() {
                         cache_len += generated.len() - 1;
@@ -493,9 +491,10 @@ impl Fermi for FermiService {
                                 .is_ok()
                             {
                                 cache_len += 1;
-                                if let Some(im_end) = im_end_id {
-                                    if last_token != im_end {
-                                        let _ = engine.append_tokens(&[im_end], cache_len, &device);
+                                if let Some(turn_end) = turn_end_id {
+                                    if last_token != turn_end {
+                                        let _ =
+                                            engine.append_tokens(&[turn_end], cache_len, &device);
                                         cache_len += 1;
                                     }
                                 }
@@ -527,6 +526,13 @@ impl Fermi for FermiService {
             Box::pin(ReceiverStream::new(rx)) as Self::GenerateStream
         ))
     }
+}
+
+async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        metrics.render_prometheus(),
+    )
 }
 
 fn device_setup() -> AnyResult<Device> {
@@ -623,6 +629,7 @@ fn loop_detected(recent: &[u32]) -> bool {
 
 #[tokio::main]
 async fn main() -> AnyResult<()> {
+    tracing_subscriber::fmt().with_env_filter("info").init();
     let loaded_cfg = load_config(None)?;
     if let Some(path) = &loaded_cfg.path {
         println!("🧩 使用配置文件: {}", path.display());
@@ -657,6 +664,7 @@ async fn main() -> AnyResult<()> {
     }
 
     let tokenizer = load_tokenizer(builder.tokenizer_path())?;
+    let model_arch = builder.model_arch();
 
     let addr = env::var("FERMI_GRPC_ADDR")
         .ok()
@@ -685,10 +693,12 @@ async fn main() -> AnyResult<()> {
     let disable_think = env_flag_opt("FERMI_DISABLE_THINK")
         .or(app_cfg.grpc.disable_think)
         .unwrap_or(false);
+    let metrics = Arc::new(Metrics::new());
     let service = FermiService::new(
         engine_pool,
         device,
         tokenizer,
+        model_arch,
         max_position_embeddings,
         timeout_ms,
         sampling_defaults,
@@ -696,7 +706,28 @@ async fn main() -> AnyResult<()> {
         session_max,
         default_system_prompt,
         disable_think,
+        Arc::clone(&metrics),
     );
+
+    if let Ok(addr) = env::var("FERMI_METRICS_ADDR") {
+        if !addr.trim().is_empty() {
+            let metrics_router = Router::new()
+                .route("/metrics", get(metrics_handler))
+                .with_state(Arc::clone(&metrics));
+            let metrics_addr = addr.clone();
+            tokio::spawn(async move {
+                match tokio::net::TcpListener::bind(&metrics_addr).await {
+                    Ok(listener) => {
+                        info!("metrics server listening on {}", metrics_addr);
+                        if let Err(err) = axum::serve(listener, metrics_router).await {
+                            error!("metrics server failed: {}", err);
+                        }
+                    }
+                    Err(err) => error!("failed to bind metrics server {}: {}", metrics_addr, err),
+                }
+            });
+        }
+    }
 
     println!("✅ gRPC listening on {}", addr);
     tonic::transport::Server::builder()

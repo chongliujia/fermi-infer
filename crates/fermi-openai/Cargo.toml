@@ -23,6 +23,7 @@ tokenizers = "0.21"
 candle-core = "0.8.2"
 candle-nn = "0.8.2"
 fermi-io = { path = "../fermi-io" }
+fermi-metrics = { path = "../fermi-metrics" }
 fermi-runtime = { path = "../fermi-runtime" }
 
 [features]

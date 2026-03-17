@@ -1,0 +1,51 @@
+{
+  "model": "Qwen/Qwen3-1.7B",
+  "warmup_runs": 1,
+  "measured_runs": 5,
+  "prompt_tokens": 15,
+  "max_new_tokens": 256,
+  "temperature": 0.2,
+  "top_p": 1.0,
+  "repeat_penalty": 1.1,
+  "avg_ttft_ms": 51.9565838,
+  "avg_total_ms": 13116.830175,
+  "avg_completion_tokens": 256.0,
+  "avg_tokens_per_second": 19.51691560028852,
+  "runs": [
+    {
+      "prompt_tokens": 15,
+      "completion_tokens": 256,
+      "ttft_ms": 51.543375000000005,
+      "total_ms": 13107.65675,
+      "tokens_per_second": 19.530569413179055
+    },
+    {
+      "prompt_tokens": 15,
+      "completion_tokens": 256,
+      "ttft_ms": 52.003084,
+      "total_ms": 13123.52025,
+      "tokens_per_second": 19.506961175298983
+    },
+    {
+      "prompt_tokens": 15,
+      "completion_tokens": 256,
+      "ttft_ms": 52.240292000000004,
+      "total_ms": 13119.533958,
+      "tokens_per_second": 19.51288824889217
+    },
+    {
+      "prompt_tokens": 15,
+      "completion_tokens": 256,
+      "ttft_ms": 51.680334,
+      "total_ms": 13109.995375,
+      "tokens_per_second": 19.527085454826103
+    },
+    {
+      "prompt_tokens": 15,
+      "completion_tokens": 256,
+      "ttft_ms": 52.315833999999995,
+      "total_ms": 13123.444542,
+      "tokens_per_second": 19.507073709246296
+    }
+  ]
+}

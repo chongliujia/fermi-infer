@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/fermi-bench",
   "crates/fermi-cli",
   "crates/fermi-core",
+  "crates/fermi-eval",
   "crates/fermi-io",
   "crates/fermi-models",
   "crates/fermi-runtime",

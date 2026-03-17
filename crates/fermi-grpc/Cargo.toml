@@ -9,9 +9,11 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"
+axum = { version = "0.7", features = ["json"] }
 candle-core = "0.8.2"
 candle-nn = "0.8.2"
 fermi-io = { path = "../fermi-io" }
+fermi-metrics = { path = "../fermi-metrics" }
 fermi-runtime = { path = "../fermi-runtime" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-stream = "0.1"
@@ -19,6 +21,8 @@ tonic = { version = "0.11", features = ["transport"] }
 tokenizers = "0.21"
 uuid = { version = "1", features = ["v4"] }
 prost = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 tonic-build = "0.11"

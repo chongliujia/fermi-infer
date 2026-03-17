@@ -1,0 +1,56 @@
+[
+  {
+    "name": "first_principles",
+    "category": "chat",
+    "prompt": "请用中文解释什么是第一性原理，并给一个工程例子。",
+    "system_prompt": "你是一个严谨的中文技术助手。",
+    "required_all": ["第一性原理"],
+    "required_any": ["本质", "基本假设", "拆解"],
+    "forbidden_any": ["作为一个AI"],
+    "min_chars": 40
+  },
+  {
+    "name": "photosynthesis",
+    "category": "knowledge",
+    "prompt": "请用中文简要说明光合作用的作用，并提到会消耗什么、产生什么。",
+    "required_all": ["光合作用"],
+    "required_any": ["二氧化碳", "氧气", "葡萄糖"],
+    "forbidden_any": ["作为一个AI"],
+    "min_chars": 30
+  },
+  {
+    "name": "python_fib",
+    "category": "code",
+    "prompt": "请写一个 Python 函数 fib(n)，返回斐波那契数列第 n 项，并给一个简单调用示例。",
+    "system_prompt": "请直接给出代码和简短说明。",
+    "required_all": ["def fib"],
+    "required_any": ["return", "print", "示例"],
+    "forbidden_any": ["作为一个AI"],
+    "min_chars": 20
+  },
+  {
+    "name": "reasoning_scale",
+    "category": "reasoning",
+    "prompt": "有 8 个球，其中 1 个重量不同，但不知道更重还是更轻。只称 2 次，是否一定能找出异常球并判断轻重？请给结论。",
+    "system_prompt": "请直接给结论，并用一两句话说明理由。",
+    "required_any": ["不能", "不一定", "无法"],
+    "min_chars": 10
+  },
+  {
+    "name": "system_following",
+    "category": "instruction",
+    "prompt": "请介绍一下 Rust。",
+    "system_prompt": "只用两句话回答，并且必须提到内存安全。",
+    "required_all": ["内存安全"],
+    "min_chars": 10,
+    "max_chars": 120
+  },
+  {
+    "name": "summary_arch",
+    "category": "summary",
+    "prompt": "某推理系统采用分层设计：入口层负责协议转换和请求治理，运行时层负责调度、采样与会话管理，模型层负责 attention、KV cache 与前向计算，I/O 层负责模型下载、缓存与配置兼容。请用中文总结其架构要点。",
+    "required_any": ["分层", "调度", "KV"],
+    "forbidden_any": ["作为一个AI"],
+    "min_chars": 30
+  }
+]

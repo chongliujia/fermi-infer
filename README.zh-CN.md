@@ -1,126 +1,192 @@
 # fermi-infer
 
-**专为小语言模型 (SLMs) 打造的 Rust 原生推理引擎。**
+**一个面向本地小语言模型的 Rust 原生推理引擎。**
 
-在 Apple Silicon 上通过 Metal (GPU) 全加速，以极快的速度和零延迟启动运行高效模型（如 Qwen、Phi、SmolLM）。
+`fermi-infer` 目前优先面向 Apple Silicon 本地推理场景，基于 Candle + Metal，提供 CLI、OpenAI 兼容 HTTP、gRPC 三个入口，并补齐了 benchmark、eval、metrics 等工程化基础能力。
 
-## 文档
+## 项目现在能做什么
 
-- English (default): `README.md`
-- 中文文档：`README.zh-CN.md`
+- 在 `Metal` / `CUDA` / `CPU` 上运行 decoder-only 模型
+- 从 `config.json` 自动识别模型架构
+- 首次运行时自动从 Hugging Face 下载模型
+- 提供：
+  - 终端交互式聊天
+  - OpenAI 兼容 HTTP 服务
+  - gRPC 流式服务
+- 内置：
+  - 基准测试工具 `fermi-bench`
+  - 效果回归工具 `fermi-eval`
+  - Prometheus 风格指标输出
 
-## 亮点
+## 当前定位
 
-- **Mac 优先（Metal）**：针对 Apple Silicon 优化，默认 F16。
-- **易用服务**：本地 CLI、gRPC 流式、OpenAI 兼容 HTTP。
-- **HuggingFace 模型**：自动下载 + 本地缓存，支持离线。
-- **thinking 模式**：`thinking=on|off|auto`（OpenAI API）。
+它已经不是 demo，但也还不是完整工业级推理引擎。
 
-## 快速开始（macOS / Metal）
+当前做得比较扎实的部分：
+
+- 单请求本地推理
+- 流式输出
+- Qwen / Phi-3 / Llama 架构装载
+- 按模型族区分 prompt template 和 stop token
+- benchmark / eval 回归
+- OpenAI / gRPC 服务化与基础可观测性
+
+仍在继续补强的部分：
+
+- batching / 调度
+- paged KV cache
+- 更强的高并发吞吐
+- 更多模型族
+- 更完整的生产治理
+
+## 当前支持的模型架构
+
+- `Qwen`
+  - 支持 Qwen2.5 / Qwen3 风格 causal LM
+  - 推荐起点：`Qwen/Qwen3-1.7B`
+- `Llama`
+  - 支持标准 safetensors 布局的 Llama-family 模型
+  - 如果要做对话，建议直接使用 `meta-llama/Llama-3.2-1B-Instruct`
+- `Phi-3`
+  - 支持 Phi-3 / Phi-3.5 风格 causal LM
+
+注意：
+
+- 如果你要做对话或指令跟随，优先使用 `Instruct` 模型。
+- `base` 模型虽然可能能加载，但很容易出现 prompt 回显、指令跟随差、对话质量不稳定等问题。
+
+## 快速开始
+
+### CLI 交互聊天
+
+```bash
+cargo run -p fermi-infer --release --features metal -- chat
+```
+
+### CLI 单轮问答
+
+```bash
+cargo run -p fermi-infer --release --features metal -- \
+  --model Qwen/Qwen3-1.7B \
+  --preset chat-precise \
+  --prompt "请解释什么是第一性原理。"
+```
+
+### 启动 OpenAI 兼容服务
 
 ```bash
 cargo run -p fermi-openai --release --features metal
 ```
 
-然后用 curl 测试（流式）：
+然后本地调用：
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [{"role":"user","content":"你好"}],
-    "stream": true,
-    "max_tokens": 256,
-    "temperature": 0.7,
-    "thinking": "off"
+    "model": "Qwen/Qwen3-1.7B",
+    "messages": [
+      {"role": "system", "content": "You are a precise technical assistant."},
+      {"role": "user", "content": "Explain Rust ownership in plain English."}
+    ],
+    "stream": false,
+    "temperature": 0.2,
+    "max_tokens": 256
   }'
 ```
 
-## OpenAI 兼容 HTTP API
+### 跑 benchmark
 
 ```bash
-cargo run -p fermi-openai --release --features metal
+cargo run -p fermi-bench --release --features metal -- \
+  --model Qwen/Qwen3-1.7B \
+  --suite all \
+  --preset chat-precise \
+  --runs 3 \
+  --warmup 1 \
+  --json \
+  --out reports/bench_suite.json
 ```
 
-默认地址：`0.0.0.0:8000`
-
-支持端点：
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `GET /v1/models`
-
-### thinking 控制
-
-`/v1/chat/completions` 支持：
-- `thinking: "on" | "off" | "auto"`
-  - `on`：要求把思考放进 `<think>...</think>`
-  - `off`：禁止思考输出
-  - `auto`：模型支持则开启，否则关闭
-
-可通过环境变量覆盖：
-- `FERMI_SUPPORTS_THINKING=1|0`
-- `FERMI_DEFAULT_THINKING=on|off|auto`
-- `FERMI_DISABLE_THINK=1`（强制关闭）
-
-## Gradio Demo（OpenAI API）
+### 跑 eval
 
 ```bash
-cargo run -p fermi-openai --release --features metal
+cargo run -p fermi-eval --release --features metal -- \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --preset chat-precise \
+  --json \
+  --out reports/eval_llama_instruct.json
 ```
+
+## Prompt 模板与采样预设
+
+项目现在会按模型族自动选择 prompt 模板：
+
+- `Qwen` / `Phi-3`：ChatML 风格
+- `Llama`：Llama 3 风格 header / EOT token
+
+支持的 sampling preset：
+
+- `chat-balanced`
+- `chat-precise`
+- `reasoning`
+- `creative`
+
+示例：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r demo/requirements.txt
-python demo/gradio_app.py
+cargo run -p fermi-infer --release --features metal -- \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --preset chat-precise \
+  --prompt "Introduce Rust in exactly two sentences and mention memory safety."
 ```
 
-## CLI 运行
+## Hugging Face 模型下载
+
+模型查找顺序：
+
+1. `FERMI_MODEL_DIR`
+2. `--model` 指向的本地目录
+3. 本机 Hugging Face cache
+4. 从 Hugging Face 在线下载
+
+模型目录需要这些文件：
+
+- `tokenizer.json`
+- `config.json`
+- `model.safetensors`
+  - 或 `model.safetensors.index.json` + shard 文件
+
+如果模型是 gated/private，需要先配置 token：
 
 ```bash
-cargo run -p fermi-infer --release --features metal
+export HF_TOKEN=hf_your_token_here
+# 或
+export HUGGINGFACE_HUB_TOKEN=hf_your_token_here
 ```
 
-CUDA：
+然后先去模型页申请权限，例如：
 
-```bash
-cargo run -p fermi-infer --release --features cuda
-```
+- [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
 
-交互命令：
-- `/help` 帮助
-- `/reset` 清空上下文
-- `/exit` 退出
+## 配置
 
-CLI 参数：
-- `--config PATH` 指定配置文件（默认自动发现 `./fermi.toml`）
-- `--offline` / `--online` 强制离线/在线模型加载
-- `--max-new-tokens N` 生成上限
-- `--repeat-penalty P` 重复惩罚
+配置发现顺序：
 
-## gRPC API
-
-Proto 定义：
-
-```
-crates/fermi-grpc/proto/fermi.proto
-```
-
-## 会话（简化版）
-
-当前是内存型 session，已支持 TTL / LRU 回收。
-
-## 环境变量
-
-推荐优先使用 `fermi.toml` 统一配置，再用环境变量做覆盖。
-模型架构会通过 `config.json`（`model_type` / `architectures`）自动识别。
-
-自动发现顺序：
-- CLI `--config PATH`（仅 CLI）
+- CLI `--config PATH`
 - `FERMI_CONFIG=/path/to/fermi.toml`
 - 当前目录 `./fermi.toml`
 
-示例 `fermi.toml`：
+参数优先级：
+
+- 请求 / CLI 参数
+- 环境变量
+- `fermi.toml`
+- 内置默认值
+
+建议从 `fermi.toml.example` 开始。
+
+示例：
 
 ```toml
 [model]
@@ -130,8 +196,8 @@ offline = false
 [generation]
 default_max_new_tokens = 256
 max_new_tokens_cap = 9056
-temperature = 0.2
-top_p = 1.0
+temperature = 0.3
+top_p = 0.95
 repeat_penalty = 1.1
 
 [cli]
@@ -160,65 +226,107 @@ default_system_prompt_file = "prompts/system.txt"
 disable_think = false
 ```
 
-可直接复制 `fermi.toml.example` 作为起点。
+常用环境变量：
 
-- `FERMI_MODEL` 模型 ID（默认：`Qwen/Qwen3-1.7B`）
-- `FERMI_OFFLINE=1` / `HF_HUB_OFFLINE=1` 关闭在线下载
-- `FERMI_ENGINE_POOL` HTTP 服务器实例数量
-- `FERMI_OPENAI_ADDR` HTTP 监听地址
-- `FERMI_GRPC_ADDR` gRPC 监听地址
-- `FERMI_DEFAULT_SYSTEM_PROMPT` / `FERMI_DEFAULT_SYSTEM_PROMPT_FILE` 默认系统提示词（文本或文件）
-- `FERMI_DEFAULT_THINKING` / `FERMI_SUPPORTS_THINKING` / `FERMI_DISABLE_THINK`
-- `FERMI_SESSION_TTL_MS` gRPC 会话空闲 TTL（毫秒，未设置或 `0` 表示关闭）
-- `FERMI_SESSION_MAX` gRPC 内存会话上限（超过后按 LRU 回收）
-- `FERMI_DEFAULT_MAX_NEW_TOKENS` 生成默认上限（所有入口统一）
-- `FERMI_MAX_NEW_TOKENS_CAP` 生成硬上限
-- `FERMI_DEFAULT_TEMPERATURE` 默认温度（范围：`0.0` - `2.0`）
-- `FERMI_DEFAULT_TOP_P` 默认 top-p（范围：`(0.0, 1.0]`）
-- `FERMI_DEFAULT_REPEAT_PENALTY` 默认重复惩罚（范围：`1.0` - `2.0`）
+- `FERMI_MODEL`
+- `FERMI_OFFLINE`
+- `HF_HUB_OFFLINE`
+- `FERMI_ENGINE_POOL`
+- `FERMI_OPENAI_ADDR`
+- `FERMI_GRPC_ADDR`
+- `FERMI_TIMEOUT_MS`
+- `FERMI_SESSION_TTL_MS`
+- `FERMI_SESSION_MAX`
+- `FERMI_DEFAULT_SYSTEM_PROMPT`
+- `FERMI_DEFAULT_SYSTEM_PROMPT_FILE`
+- `FERMI_DEFAULT_THINKING`
+- `FERMI_SUPPORTS_THINKING`
+- `FERMI_DISABLE_THINK`
+- `FERMI_DEFAULT_MAX_NEW_TOKENS`
+- `FERMI_MAX_NEW_TOKENS_CAP`
+- `FERMI_DEFAULT_TEMPERATURE`
+- `FERMI_DEFAULT_TOP_P`
+- `FERMI_DEFAULT_REPEAT_PENALTY`
+- `FERMI_METRICS_ADDR`
 
-参数优先级（统一）：
-- 请求/CLI 参数 > 环境变量 > `fermi.toml` > 内置默认值
+## OpenAI 兼容 API
 
-## API 兼容性说明
+当前提供：
 
-- OpenAI 接口错误返回统一为 `{"error": {...}}` JSON 结构（不再返回裸字符串）。
-- `finish_reason` 语义更准确：
-  - 命中 stop token 时返回 `stop`
-  - 达到 `max_*_tokens` 上限时返回 `length`
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `GET /v1/models`
+- `GET /metrics`
 
-## 模型支持
+`thinking` 参数支持：
 
-当前支持：
-- **Qwen 系列（Qwen2.5 / Qwen3）**
-  - 已测试：`Qwen/Qwen3-1.7B`
-  - 支持：Qwen2.5 CausalLM safetensors 布局
-- **Phi-3 风格架构**
-  - 支持 Phi-3 / Phi-3.5 风格 CausalLM safetensors 布局
+- `on`
+- `off`
+- `auto`
 
-规划中：
-- 更多 Qwen / DeepSeek 变体
-- 量化权重（更快冷启、更低内存）
+实际行为会受这些因素共同影响：
 
-## 项目定位
+- 请求里的 `thinking`
+- 模型本身是否支持
+- `FERMI_SUPPORTS_THINKING`
+- `FERMI_DEFAULT_THINKING`
+- `FERMI_DISABLE_THINK`
 
-fermi-infer 是一个 **Rust 优先、Mac 友好** 的推理栈：
-- 快速启动
-- 流式低延迟
-- 简单易部署
+## Metrics
 
-## 路线图
+OpenAI 服务会在同一个 HTTP 地址上暴露：
 
-- KV cache / attention 性能优化
-- 吞吐与延迟基准工具
-- 更多模型后端
-- reasoning 分离（可选）
-- 可观测性与指标
+- `GET /metrics`
 
-## 贡献指南
+gRPC 可通过单独地址暴露 metrics：
 
-欢迎 PR，建议流程：
-1. Fork 并创建 feature 分支
-2. 保持改动集中且清晰
-3. 运行 `cargo fmt`（可选 `cargo clippy`）
-4. 提交 PR 并附说明/日志
+```bash
+export FERMI_METRICS_ADDR=0.0.0.0:9100
+```
+
+当前已经覆盖的指标包括：
+
+- 请求总数
+- 错误数
+- 活跃请求数
+- 排队等待时间
+- TTFT
+- 生成 token 总数
+- 生成耗时
+- 平均 tokens/s
+
+## Workspace 结构
+
+- `crates/fermi-runtime`：推理引擎、配置、session、prompting、sampling
+- `crates/fermi-models`：模型实现
+- `crates/fermi-io`：模型发现、加载、Hugging Face 下载
+- `crates/fermi-cli`：终端交互入口
+- `crates/fermi-openai`：OpenAI 兼容 HTTP 服务
+- `crates/fermi-grpc`：gRPC 流式服务
+- `crates/fermi-bench`：benchmark 工具
+- `crates/fermi-eval`：效果回归工具
+- `crates/fermi-metrics`：指标采集
+
+## 文档
+
+- 英文 README：[README.md](README.md)
+- 项目总览：[docs/fermi-project-overview.zh-CN.md](docs/fermi-project-overview.zh-CN.md)
+- 分享稿：[docs/fermi-infer-tech-blog-share.zh-CN.md](docs/fermi-infer-tech-blog-share.zh-CN.md)
+- Qwen 深挖：[docs/qwen-architecture-tech-blog.zh-CN.md](docs/qwen-architecture-tech-blog.zh-CN.md)
+
+## 开发
+
+```bash
+cargo check
+cargo test
+```
+
+更聚焦的验证方式：
+
+```bash
+cargo test -p fermi-runtime -p fermi-bench -p fermi-eval -p fermi-openai -p fermi-grpc
+```
+
+## License
+
+Apache-2.0

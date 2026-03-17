@@ -116,10 +116,10 @@ impl LoadedConfig {
         if candidate.is_absolute() {
             return candidate;
         }
-        if let Some(config_path) = &self.path
-            && let Some(parent) = config_path.parent()
-        {
-            return parent.join(candidate);
+        if let Some(config_path) = &self.path {
+            if let Some(parent) = config_path.parent() {
+                return parent.join(candidate);
+            }
         }
         candidate
     }

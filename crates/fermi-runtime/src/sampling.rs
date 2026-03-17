@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use fermi_io::ModelArch;
 
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 pub const DEFAULT_MAX_NEW_TOKENS_CAP: usize = 9056;
@@ -33,6 +34,14 @@ pub struct SamplingParams {
     pub temperature: f32,
     pub top_p: f32,
     pub repeat_penalty: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingPreset {
+    ChatBalanced,
+    ChatPrecise,
+    Reasoning,
+    Creative,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -128,6 +137,78 @@ pub fn resolve_sampling_params(
         top_p,
         repeat_penalty,
     })
+}
+
+pub fn parse_sampling_preset(name: &str) -> Result<SamplingPreset> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "chat-balanced" | "chat_balanced" | "balanced" => Ok(SamplingPreset::ChatBalanced),
+        "chat-precise" | "chat_precise" | "precise" => Ok(SamplingPreset::ChatPrecise),
+        "reasoning" => Ok(SamplingPreset::Reasoning),
+        "creative" => Ok(SamplingPreset::Creative),
+        other => bail!(
+            "unsupported sampling preset '{}', supported values: chat-balanced, chat-precise, reasoning, creative",
+            other
+        ),
+    }
+}
+
+pub fn apply_sampling_preset(
+    defaults: &SamplingDefaults,
+    arch: ModelArch,
+    preset: SamplingPreset,
+) -> SamplingDefaults {
+    let mut tuned = defaults.clone();
+    match (arch, preset) {
+        (ModelArch::Llama, SamplingPreset::ChatPrecise) => {
+            tuned.default_max_new_tokens = tuned.default_max_new_tokens.min(160);
+            tuned.temperature = 0.1;
+            tuned.top_p = 0.9;
+            tuned.repeat_penalty = tuned.repeat_penalty.max(1.05);
+        }
+        (ModelArch::Llama, SamplingPreset::ChatBalanced) => {
+            tuned.default_max_new_tokens = tuned.default_max_new_tokens.min(192);
+            tuned.temperature = 0.25;
+            tuned.top_p = 0.92;
+            tuned.repeat_penalty = tuned.repeat_penalty.max(1.08);
+        }
+        (ModelArch::Llama, SamplingPreset::Reasoning) => {
+            tuned.default_max_new_tokens = tuned.default_max_new_tokens.min(384);
+            tuned.temperature = 0.15;
+            tuned.top_p = 0.95;
+            tuned.repeat_penalty = tuned.repeat_penalty.max(1.04);
+        }
+        (ModelArch::Llama, SamplingPreset::Creative) => {
+            tuned.default_max_new_tokens = tuned.default_max_new_tokens.min(256);
+            tuned.temperature = 0.8;
+            tuned.top_p = 0.97;
+            tuned.repeat_penalty = tuned.repeat_penalty.max(1.02);
+        }
+        (_, SamplingPreset::ChatPrecise) => {
+            tuned.default_max_new_tokens = tuned.default_max_new_tokens.min(192);
+            tuned.temperature = 0.15;
+            tuned.top_p = 0.92;
+            tuned.repeat_penalty = tuned.repeat_penalty.max(1.05);
+        }
+        (_, SamplingPreset::ChatBalanced) => {
+            tuned.default_max_new_tokens = tuned.default_max_new_tokens.min(256);
+            tuned.temperature = 0.3;
+            tuned.top_p = 0.95;
+            tuned.repeat_penalty = tuned.repeat_penalty.max(1.08);
+        }
+        (_, SamplingPreset::Reasoning) => {
+            tuned.default_max_new_tokens = tuned.default_max_new_tokens.min(384);
+            tuned.temperature = 0.2;
+            tuned.top_p = 0.95;
+            tuned.repeat_penalty = tuned.repeat_penalty.max(1.04);
+        }
+        (_, SamplingPreset::Creative) => {
+            tuned.default_max_new_tokens = tuned.default_max_new_tokens.min(320);
+            tuned.temperature = 0.85;
+            tuned.top_p = 0.98;
+            tuned.repeat_penalty = tuned.repeat_penalty.max(1.01);
+        }
+    }
+    tuned
 }
 
 fn validate_max_new_tokens(v: usize) -> Result<()> {
@@ -230,5 +311,23 @@ mod tests {
         assert_eq!(defaults.temperature, 0.6);
         assert_eq!(defaults.top_p, 0.8);
         assert_eq!(defaults.repeat_penalty, 1.2);
+    }
+
+    #[test]
+    fn parses_sampling_presets() {
+        assert_eq!(
+            parse_sampling_preset("chat-precise").expect("preset"),
+            SamplingPreset::ChatPrecise
+        );
+        assert!(parse_sampling_preset("unknown").is_err());
+    }
+
+    #[test]
+    fn llama_precise_preset_reduces_temperature() {
+        let defaults = SamplingDefaults::default();
+        let tuned = apply_sampling_preset(&defaults, ModelArch::Llama, SamplingPreset::ChatPrecise);
+        assert!(tuned.temperature < defaults.temperature);
+        assert!(tuned.top_p < defaults.top_p);
+        assert!(tuned.default_max_new_tokens <= defaults.default_max_new_tokens);
     }
 }

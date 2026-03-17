@@ -763,11 +763,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
-name = "fermi-core"
-version = "0.1.0"
-
-[[package]]
-name = "fermi-grpc"
+name = "fermi-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -775,12 +771,48 @@ dependencies = [
  "candle-nn",
  "fermi-io",
  "fermi-runtime",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
+name = "fermi-core"
+version = "0.1.0"
+
+[[package]]
+name = "fermi-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "fermi-io",
+ "fermi-runtime",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
+name = "fermi-grpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "candle-core",
+ "candle-nn",
+ "fermi-io",
+ "fermi-metrics",
+ "fermi-runtime",
  "prost",
  "tokenizers",
  "tokio",
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -830,6 +862,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "fermi-io",
+ "fermi-metrics",
  "fermi-runtime",
  "serde",
  "serde_json",
@@ -851,6 +884,7 @@ dependencies = [
  "fermi-io",
  "fermi-models",
  "rand 0.8.5",
+ "tokenizers",
 ]
 
 [[package]]

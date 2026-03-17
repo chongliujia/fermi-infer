@@ -1,0 +1,56 @@
+[
+  {
+    "name": "first_principles",
+    "category": "chat",
+    "prompt": "Explain what first-principles thinking is and give one engineering example.",
+    "system_prompt": "You are a rigorous technical assistant.",
+    "required_all": ["first-principles"],
+    "required_any": ["fundamental", "assumption", "break"],
+    "forbidden_any": ["As an AI"],
+    "min_chars": 40
+  },
+  {
+    "name": "photosynthesis",
+    "category": "knowledge",
+    "prompt": "Briefly explain what photosynthesis does and mention what it consumes and what it produces.",
+    "required_all": ["photosynthesis"],
+    "required_any": ["carbon dioxide", "oxygen", "glucose"],
+    "forbidden_any": ["As an AI"],
+    "min_chars": 30
+  },
+  {
+    "name": "python_fib",
+    "category": "code",
+    "prompt": "Write a Python function fib(n) that returns the nth Fibonacci number, and include a short example call.",
+    "system_prompt": "Return code first, then one short explanation.",
+    "required_all": ["def fib"],
+    "required_any": ["return", "print", "example"],
+    "forbidden_any": ["As an AI"],
+    "min_chars": 20
+  },
+  {
+    "name": "reasoning_scale",
+    "category": "reasoning",
+    "prompt": "There are 8 balls and 1 has a different weight, but you do not know whether it is heavier or lighter. With only two weighings, can you always identify the odd ball and whether it is heavier or lighter? Give the conclusion.",
+    "system_prompt": "Give the conclusion directly and justify it briefly.",
+    "required_any": ["no", "cannot", "not always"],
+    "min_chars": 10
+  },
+  {
+    "name": "system_following",
+    "category": "instruction",
+    "prompt": "Introduce Rust.",
+    "system_prompt": "Answer in exactly two sentences and mention memory safety.",
+    "required_all": ["memory safety"],
+    "min_chars": 10,
+    "max_chars": 140
+  },
+  {
+    "name": "summary_arch",
+    "category": "summary",
+    "prompt": "An inference system uses a layered design: the entry layer handles protocol translation and request governance, the runtime layer handles scheduling, sampling, and session management, the model layer handles attention, KV cache, and forward computation, and the I/O layer handles model download, caching, and config compatibility. Summarize the architecture.",
+    "required_any": ["layer", "scheduling", "KV"],
+    "forbidden_any": ["As an AI"],
+    "min_chars": 30
+  }
+]

@@ -236,12 +236,13 @@ impl Attention {
             self.cache_v_tail = Some(new_v);
             self.cache_len += take;
 
-            if cur_len + take == Self::KV_CHUNK_SIZE
-                && let (Some(k_full), Some(v_full)) =
+            if cur_len + take == Self::KV_CHUNK_SIZE {
+                if let (Some(k_full), Some(v_full)) =
                     (self.cache_k_tail.take(), self.cache_v_tail.take())
-            {
-                self.cache_k.push(k_full);
-                self.cache_v.push(v_full);
+                {
+                    self.cache_k.push(k_full);
+                    self.cache_v.push(v_full);
+                }
             }
 
             start += take;

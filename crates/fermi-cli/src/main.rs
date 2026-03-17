@@ -1,9 +1,10 @@
 use anyhow::{Error as E, Result};
 use candle_core::Device;
-use fermi_io::load_tokenizer;
+use fermi_io::{ModelArch, load_tokenizer};
 use fermi_runtime::{
-    GenerationConfig, ModelBuilder, load_config, resolve_sampling_params,
-    sampling_defaults_from_sources,
+    GenerationConfig, ModelBuilder, assistant_turn_end_token_id, apply_sampling_preset,
+    build_stop_tokens, load_config, parse_sampling_preset, render_history_prompt,
+    render_user_chunk, resolve_sampling_params, sampling_defaults_from_sources,
 };
 use std::env;
 use std::io::{self, Write};
@@ -24,12 +25,12 @@ fn main() -> Result<()> {
     // ==========================================
     // 指定 Qwen3 官方模型 ID / 本地路径
     // ==========================================
-    let model_repo_id = cli_cfg
-        .model
-        .clone()
-        .or_else(|| std::env::var("FERMI_MODEL").ok())
-        .or_else(|| app_cfg.model.id.clone())
-        .unwrap_or_else(|| "Qwen/Qwen3-1.7B".to_string());
+    let (model_repo_id, model_source) = resolve_model_id(
+        cli_cfg.model.clone(),
+        std::env::var("FERMI_MODEL").ok(),
+        app_cfg.model.id.clone(),
+        "Qwen/Qwen3-1.7B",
+    );
     let offline = cli_cfg
         .offline
         .or_else(|| env_flag_opt("FERMI_OFFLINE"))
@@ -38,12 +39,16 @@ fn main() -> Result<()> {
         .unwrap_or(false);
 
     println!("📥 准备模型文件...");
-    println!("📦 模型: {}", model_repo_id);
+    println!("📦 模型: {} ({})", model_repo_id, model_source);
 
     let builder = ModelBuilder::new(&model_repo_id, !offline)?;
     println!("🧠 架构: {:?}", builder.model_arch());
-    let sampling_defaults =
+    let mut sampling_defaults =
         sampling_defaults_from_sources(app_cfg.generation.to_sampling_overrides())?;
+    if let Some(preset) = cli_cfg.preset.as_deref() {
+        sampling_defaults =
+            apply_sampling_preset(&sampling_defaults, builder.model_arch(), parse_sampling_preset(preset)?);
+    }
     let sampling = resolve_sampling_params(
         cli_cfg.max_new_tokens,
         cli_cfg.temperature,
@@ -57,26 +62,18 @@ fn main() -> Result<()> {
 
     let mut engine = builder.create_engine(&device)?;
     let tokenizer = load_tokenizer(builder.tokenizer_path())?;
+    let model_arch = builder.model_arch();
     engine.clear_kv_cache();
-
-    println!("💬 交互模式：输入问题，回车发送。命令：/help /reset /exit");
 
     let mut history: Vec<(String, String)> = Vec::new();
     let mut current_pos: usize = 0;
     let mut has_context = false;
-    let im_end_id = tokenizer.token_to_id("<|im_end|>");
-    let mut stop_tokens = Vec::new();
-    if let Some(eos) = tokenizer.token_to_id("<|endoftext|>") {
-        stop_tokens.push(eos);
-    }
-    if let Some(im_end) = tokenizer.token_to_id("<|im_end|>") {
-        stop_tokens.push(im_end);
-    }
+    let turn_end_id = assistant_turn_end_token_id(model_arch, &tokenizer);
 
     let gen_cfg = GenerationConfig {
         max_new_tokens: sampling.max_new_tokens,
         repeat_penalty: sampling.repeat_penalty,
-        stop_tokens,
+        stop_tokens: build_stop_tokens(model_arch, &tokenizer),
         temperature: sampling.temperature,
         top_p: sampling.top_p,
     };
@@ -90,6 +87,8 @@ fn main() -> Result<()> {
         .or(app_cfg.cli.disable_think)
         .unwrap_or(false);
     let mut default_system_prompt = resolve_default_system_prompt(
+        cli_cfg.system_prompt.clone(),
+        cli_cfg.system_prompt_file.clone(),
         env::var("FERMI_DEFAULT_SYSTEM_PROMPT").ok(),
         env::var("FERMI_DEFAULT_SYSTEM_PROMPT_FILE").ok(),
         app_cfg.cli.default_system_prompt.clone(),
@@ -99,6 +98,27 @@ fn main() -> Result<()> {
     if disable_think {
         default_system_prompt = Some(append_disable_think_hint(default_system_prompt.as_deref()));
     }
+
+    if let RunMode::SinglePrompt(prompt) = &cli_cfg.run_mode {
+        let result = generate_single_response(
+            &mut *engine,
+            &tokenizer,
+            &device,
+            model_arch,
+            prompt,
+            default_system_prompt.as_deref(),
+            &gen_cfg,
+            timeout_ms,
+        )?;
+        println!("{}", result.text);
+        if let Some(reason) = result.truncated_reason {
+            eprintln!("⚠️ 输出已提前停止: {}", reason);
+        }
+        println!("\n\n✅ 完成");
+        return Ok(());
+    }
+
+    println!("💬 交互模式：输入问题，回车发送。命令：/help /reset /exit");
 
     loop {
         print!("> ");
@@ -131,7 +151,7 @@ fn main() -> Result<()> {
         let mut offset = if has_context { current_pos } else { 0 };
         let mut input_ids = tokenizer
             .encode(
-                render_user_chunk(line, has_context, default_system_prompt.as_deref()),
+                render_user_chunk(model_arch, line, has_context, default_system_prompt.as_deref()),
                 false,
             )
             .map_err(E::msg)?
@@ -141,6 +161,7 @@ fn main() -> Result<()> {
         if expected_max > max_ctx {
             let pairs = history_pairs(&history);
             let (trunc_ids, kept_pairs) = build_truncated_prompt(
+                model_arch,
                 &pairs,
                 line,
                 default_system_prompt.as_deref(),
@@ -247,9 +268,9 @@ fn main() -> Result<()> {
             if let Some(&last_token) = generated.last() {
                 engine.append_tokens(&[last_token], cache_len, &device)?;
                 cache_len += 1;
-                if let Some(im_end) = im_end_id {
-                    if last_token != im_end {
-                        engine.append_tokens(&[im_end], cache_len, &device)?;
+                if let Some(turn_end) = turn_end_id {
+                    if last_token != turn_end {
+                        engine.append_tokens(&[turn_end], cache_len, &device)?;
                         cache_len += 1;
                     }
                 }
@@ -281,6 +302,16 @@ struct CliConfig {
     offline: Option<bool>,
     config: Option<String>,
     timeout_ms: Option<u64>,
+    system_prompt: Option<String>,
+    system_prompt_file: Option<String>,
+    run_mode: RunMode,
+    preset: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum RunMode {
+    Chat,
+    SinglePrompt(String),
 }
 
 fn parse_args() -> Result<CliConfig> {
@@ -292,10 +323,15 @@ fn parse_args() -> Result<CliConfig> {
     let mut offline: Option<bool> = None;
     let mut config: Option<String> = None;
     let mut timeout_ms: Option<u64> = None;
+    let mut system_prompt: Option<String> = None;
+    let mut system_prompt_file: Option<String> = None;
+    let mut run_mode = RunMode::Chat;
+    let mut preset: Option<String> = None;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "chat" => {}
             "--model" => {
                 if let Some(v) = args.next() {
                     model = Some(v);
@@ -314,6 +350,34 @@ fn parse_args() -> Result<CliConfig> {
                     config = Some(v);
                 } else {
                     return Err(E::msg("--config requires a value"));
+                }
+            }
+            "--prompt" => {
+                if let Some(v) = args.next() {
+                    run_mode = RunMode::SinglePrompt(v);
+                } else {
+                    return Err(E::msg("--prompt requires a value"));
+                }
+            }
+            "--system-prompt" => {
+                if let Some(v) = args.next() {
+                    system_prompt = Some(v);
+                } else {
+                    return Err(E::msg("--system-prompt requires a value"));
+                }
+            }
+            "--system-prompt-file" => {
+                if let Some(v) = args.next() {
+                    system_prompt_file = Some(v);
+                } else {
+                    return Err(E::msg("--system-prompt-file requires a value"));
+                }
+            }
+            "--preset" => {
+                if let Some(v) = args.next() {
+                    preset = Some(v);
+                } else {
+                    return Err(E::msg("--preset requires a value"));
                 }
             }
             "--timeout-ms" => {
@@ -370,17 +434,26 @@ fn parse_args() -> Result<CliConfig> {
         offline,
         config,
         timeout_ms,
+        system_prompt,
+        system_prompt_file,
+        run_mode,
+        preset,
     })
 }
 
 fn print_usage() {
     println!(
-        "Usage: fermi-infer [--config PATH] [--model ID|PATH] [--offline|--online] [--timeout-ms MS] [--max-new-tokens N] [--repeat-penalty P] [--temperature T] [--top-p P]"
+        "Usage: fermi-infer [chat] [--config PATH] [--model ID|PATH] [--prompt TEXT] [--system-prompt TEXT] [--system-prompt-file PATH] [--preset NAME] [--offline|--online] [--timeout-ms MS] [--max-new-tokens N] [--repeat-penalty P] [--temperature T] [--top-p P]"
     );
+    println!("  chat              Explicitly start interactive chat mode (default if omitted)");
     println!("  --config          Config file path (default auto-discover: ./fermi.toml)");
     println!(
         "  --model           HuggingFace repo id or local model dir (default: Qwen/Qwen3-1.7B)"
     );
+    println!("  --prompt          Run a single prompt and exit");
+    println!("  --system-prompt   Override the default system prompt with inline text");
+    println!("  --system-prompt-file  Load the system prompt from a file");
+    println!("  --preset          Sampling preset: chat-balanced, chat-precise, reasoning, creative");
     println!("  --offline         Disable network access; require local model files");
     println!("  --online          Force enable network access");
     println!(
@@ -413,12 +486,21 @@ fn env_u64(key: &str) -> Option<u64> {
 }
 
 fn resolve_default_system_prompt(
+    cli_inline: Option<String>,
+    cli_file: Option<String>,
     env_inline: Option<String>,
     env_file: Option<String>,
     cfg_inline: Option<String>,
     cfg_file: Option<String>,
     loaded_cfg: &fermi_runtime::LoadedConfig,
 ) -> Result<Option<String>> {
+    if let Some(prompt) = normalize_prompt_text(cli_inline) {
+        return Ok(Some(prompt));
+    }
+    if let Some(path) = normalize_prompt_text(cli_file) {
+        let prompt = loaded_cfg.read_text_file(&path).map_err(E::msg)?;
+        return Ok(normalize_prompt_text(Some(prompt)));
+    }
     if let Some(prompt) = normalize_prompt_text(env_inline) {
         return Ok(Some(prompt));
     }
@@ -434,6 +516,116 @@ fn resolve_default_system_prompt(
         return Ok(normalize_prompt_text(Some(prompt)));
     }
     Ok(None)
+}
+
+fn resolve_model_id(
+    cli_model: Option<String>,
+    env_model: Option<String>,
+    cfg_model: Option<String>,
+    default_model: &str,
+) -> (String, &'static str) {
+    if let Some(model) = cli_model {
+        return (model, "source=cli");
+    }
+    if let Some(model) = env_model {
+        return (model, "source=env");
+    }
+    if let Some(model) = cfg_model {
+        return (model, "source=config");
+    }
+    (default_model.to_string(), "source=default")
+}
+
+fn generate_single_response(
+    engine: &mut dyn fermi_runtime::InferenceEngine,
+    tokenizer: &Tokenizer,
+    device: &Device,
+    model_arch: ModelArch,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    gen_cfg: &GenerationConfig,
+    timeout_ms: u64,
+) -> Result<SingleResponseResult> {
+    let input_ids = tokenizer
+        .encode(render_user_chunk(model_arch, prompt, false, system_prompt), false)
+        .map_err(E::msg)?
+        .get_ids()
+        .to_vec();
+
+    let mut assistant_buf = String::new();
+    let mut utf8_buffer = Utf8Buffer::new();
+    let mut think_filter = ThinkFilter::new();
+    let mut recent_tokens: Vec<u32> = Vec::with_capacity(12);
+    let mut loop_triggered = false;
+    let mut timeout_triggered = false;
+    let start_time = Instant::now();
+
+    let _generated = engine.generate_stream(
+        &input_ids,
+        device,
+        gen_cfg,
+        &mut |token_id| {
+            if timeout_ms > 0 && start_time.elapsed().as_millis() as u64 >= timeout_ms {
+                timeout_triggered = true;
+                return Ok(false);
+            }
+            if recent_tokens.len() >= 12 {
+                recent_tokens.remove(0);
+            }
+            recent_tokens.push(token_id);
+            if loop_detected(&recent_tokens) {
+                loop_triggered = true;
+                return Ok(false);
+            }
+            if let Some(text) = utf8_buffer.push_and_decode(token_id, tokenizer)? {
+                let filtered = think_filter.process(&text);
+                if !filtered.is_empty() {
+                    assistant_buf.push_str(&filtered);
+                }
+            }
+            Ok(true)
+        },
+    )?;
+
+    if let Some(tail_text) = utf8_buffer.flush(tokenizer)? {
+        let filtered = think_filter.process(&tail_text);
+        if !filtered.is_empty() {
+            assistant_buf.push_str(&filtered);
+        }
+    }
+    let tail = think_filter.flush();
+    if !tail.is_empty() {
+        assistant_buf.push_str(&tail);
+    }
+
+    if timeout_triggered {
+        if !assistant_buf.trim().is_empty() {
+            return Ok(SingleResponseResult {
+                text: assistant_buf,
+                truncated_reason: Some("generation timed out"),
+            });
+        }
+        return Err(E::msg("generation timed out in single-prompt mode"));
+    }
+    if loop_triggered {
+        if !assistant_buf.trim().is_empty() {
+            return Ok(SingleResponseResult {
+                text: assistant_buf,
+                truncated_reason: Some("repeated output detected"),
+            });
+        }
+        return Err(E::msg("generation stopped after detecting repeated output"));
+    }
+
+    Ok(SingleResponseResult {
+        text: assistant_buf,
+        truncated_reason: None,
+    })
+}
+
+struct SingleResponseResult {
+    text: String,
+    truncated_reason: Option<&'static str>,
 }
 
 fn normalize_prompt_text(v: Option<String>) -> Option<String> {
@@ -497,33 +689,8 @@ fn history_pairs(history: &[(String, String)]) -> Vec<(String, String)> {
     pairs
 }
 
-fn render_history_prompt(
-    pairs: &[(String, String)],
-    user_text: &str,
-    system_prompt: Option<&str>,
-) -> String {
-    let mut out = String::new();
-    if let Some(sys) = system_prompt {
-        if !sys.is_empty() {
-            out.push_str("<|im_start|>system\n");
-            out.push_str(sys);
-            out.push_str("<|im_end|>\n");
-        }
-    }
-    for (user, assistant) in pairs {
-        out.push_str("<|im_start|>user\n");
-        out.push_str(user);
-        out.push_str("<|im_end|>\n<|im_start|>assistant\n");
-        out.push_str(assistant);
-        out.push_str("<|im_end|>\n");
-    }
-    out.push_str("<|im_start|>user\n");
-    out.push_str(user_text);
-    out.push_str("<|im_end|>\n<|im_start|>assistant\n");
-    out
-}
-
 fn build_truncated_prompt(
+    model_arch: ModelArch,
     pairs: &[(String, String)],
     user_text: &str,
     system_prompt: Option<&str>,
@@ -534,7 +701,7 @@ fn build_truncated_prompt(
     let mut start = 0usize;
     loop {
         let kept = &pairs[start..];
-        let prompt = render_history_prompt(kept, user_text, system_prompt);
+        let prompt = render_history_prompt(model_arch, kept, user_text, system_prompt);
         let tokens = tokenizer.encode(prompt.clone(), false).map_err(E::msg)?;
         let input_ids = tokens.get_ids().to_vec();
         let expected_max = input_ids.len() + max_new_tokens + 8;
@@ -543,23 +710,6 @@ fn build_truncated_prompt(
         }
         start += 1;
     }
-}
-
-fn render_user_chunk(user_text: &str, has_context: bool, system_prompt: Option<&str>) -> String {
-    let mut out = String::new();
-    if has_context {
-        out.push('\n');
-    } else if let Some(sys) = system_prompt {
-        if !sys.is_empty() {
-            out.push_str("<|im_start|>system\n");
-            out.push_str(sys);
-            out.push_str("<|im_end|>\n");
-        }
-    }
-    out.push_str("<|im_start|>user\n");
-    out.push_str(user_text);
-    out.push_str("<|im_end|>\n<|im_start|>assistant\n");
-    out
 }
 
 struct Utf8Buffer {
@@ -663,4 +813,41 @@ fn partial_suffix_len(s: &str, tag: &str) -> usize {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_model_id_prefers_cli_then_env_then_config() {
+        let (model, source) = resolve_model_id(
+            Some("cli-model".to_string()),
+            Some("env-model".to_string()),
+            Some("cfg-model".to_string()),
+            "default-model",
+        );
+        assert_eq!(model, "cli-model");
+        assert_eq!(source, "source=cli");
+
+        let (model, source) = resolve_model_id(
+            None,
+            Some("env-model".to_string()),
+            Some("cfg-model".to_string()),
+            "default-model",
+        );
+        assert_eq!(model, "env-model");
+        assert_eq!(source, "source=env");
+    }
+
+    #[test]
+    fn think_filter_strips_think_blocks() {
+        let mut filter = ThinkFilter::new();
+        let first = filter.process("hello<think>internal");
+        let second = filter.process(" note</think>world");
+        let tail = filter.flush();
+        assert_eq!(first, "hello");
+        assert_eq!(second, "world");
+        assert_eq!(tail, "");
+    }
 }
